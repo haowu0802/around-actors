@@ -1,26 +1,26 @@
 # Privacy
 
-## Principles
+## Rules of use
 
-- **Consent:** Only use chat data you have a right to use (e.g. your own conversations with people who would reasonably accept this use).
-- **Local-first:** Prefer running models and indexes on your machine. Do not upload raw chat dumps to third-party training services.
-- **No impersonation:** Outputs approximate style and recalled context. They are not the real person and must not be used to deceive others.
-- **Minimize publication:** Public artifacts should be anonymized samples, schemas, metrics, and code—not full private histories.
+- Only process chats you are allowed to use.
+- Prefer local models and local storage. Do not upload raw dumps to third-party training APIs.
+- Model output is approximate roleplay, not the real person. Do not use it to impersonate anyone.
+- Publish code, schemas, metrics, and anonymized samples—not full private histories.
 
-## What belongs in this repository
+## OK in git
 
-- Source code, configs that contain no secrets, docs, and small synthetic/anonymized fixtures.
-- Evaluation numbers and architecture write-ups.
+- Source, secret-free config examples, docs, tiny synthetic/anonymized fixtures
+- Eval numbers and architecture notes
 
-## What must stay private
+## Keep private
 
-- Real chat export JSON/CSV/Parquet dumps
-- Persona cards derived from real people (unless fully anonymized and you accept publication risk)
-- Vector indexes built from real chats
-- API keys, `.env`, and machine-local paths to personal data
+- Real export files
+- Real-person persona cards (unless you fully anonymize and accept the risk)
+- Indexes built from real chats
+- API keys, `.env`, absolute paths to personal data
 
-These paths are ignored by `.gitignore`. Double-check before every commit.
+Check `.gitignore` before every commit.
 
-## Attribution and expectations
+## Limits
 
-Style similarity on WeChat-style short text is limited. The system may still invent facts if retrieval fails; treat answers as assisted roleplay, not ground truth.
+Short chat text is a weak style signal. Retrieval misses can still produce invented facts. Treat answers as assisted draft replies, not ground truth.

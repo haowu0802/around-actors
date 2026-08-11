@@ -1,0 +1,27 @@
+---
+description: Agent constraints for around-actors
+alwaysApply: true
+---
+
+# around-actors — agent constraints
+
+## Git
+
+- Never create commits (`git commit`).
+- Never push (`git push`), including upstream or force push.
+- Never amend, rebase, or tag for the user.
+- Do not `git add` unless the user explicitly asks for add commands or staging.
+- The user commits and pushes manually.
+
+## Language and content
+
+- No Chinese in docs, comments, commit message suggestions, or user-facing repo text. English only.
+- No local sensitive information in the repo: real chat dumps, person names from private chats, absolute machine paths, passwords, DB URLs with secrets, wxids, export filenames that identify people.
+- Prefer bland, direct engineering prose. Avoid hype, slogan-y openers, emoji decoration, and filler (“robust”, “seamless”, “powerful”, “aims to prove”, “portfolio-oriented”) unless the user asks for marketing copy.
+
+## Implementation process
+
+- Work step by step.
+- Before coding a step: state the motivation and wait for explicit agreement.
+- Do not implement later MVP pieces without agreement.
+- Product planning notes may live outside this repo; do not paste private paths or private planning content into committed files.

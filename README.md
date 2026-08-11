@@ -1,41 +1,53 @@
 # Around Actors
 
-Local-first toolkit that turns real chat exports into a **persona-conditioned LLM actor**: a small data pipeline plus prompt/RAG serving, so a locally hosted model replies a bit more like a specific person.
+Turn chat export JSON into Postgres tables and, later, a local LLM setup that roleplays a person using a persona card and retrieved memories.
 
-This repository is a portfolio-oriented implementation of that idea—focused on **data platform engineering** and **LLM systems**, not on reverse-engineering messaging clients.
+Stack focus: data pipelines + local LLM serving/eval. Not messaging-client reverse engineering.
 
-## MVP (what this aims to prove)
+## MVP
 
-Given one cleaned conversation export:
+For one cleaned conversation:
 
-1. Build an editable **persona card** and a **memory index** from chat text.
-2. Chat with a **local** OpenAI-compatible model (e.g. Ollama) under two strategies:
-   - **Persona prompt** (card + few-shot exemplars)
-   - **Persona + RAG** (same, plus retrieved memories)
-3. Run a **tiny hold-out eval** and show whether RAG helps.
+1. Persona card + memory index from chat text
+2. Local OpenAI-compatible chat with two modes: persona prompt, and persona + RAG
+3. Small hold-out comparison of the two modes
 
-Out of scope for the MVP: model fine-tuning (LoRA), chat-client decryption, heavy UI, multimodal (voice ASR / images), and production messaging bots.
+Not in MVP: LoRA, client decryption, heavy UI, voice/image models, chat bots on messaging apps.
 
 ## Status
 
-Early scaffolding. Runtime pipelines are not implemented yet.
+Raw ingest: `scripts/ingest_raw.py` → Postgres `raw.messages`. Clean / persona / chat / eval: not built yet.
+
+## Raw ingest
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env   # set DATABASE_URL
+
+python scripts/ingest_raw.py --ensure-schema --replace \
+  --file "/path/to/export.json" \
+  --actor-key person_a
+```
+
+`EXPORT_FILE`, `ACTOR_KEY`, and `DATABASE_URL` also work as env vars. Do not hard-code private paths in the repo.
+
+DDL: `sql/001_raw_messages.sql` (export fields 1:1 plus `actor_key`, `source_file`, `ingested_at`).
 
 ## Privacy
 
-**Do not commit real chat logs.** Use only consenting, personal corpora locally. The repo will ship a tiny anonymized or synthetic sample when code lands—never your full export.
+Do not commit real chat logs. Keep corpora local and consented. Ship only anonymized or synthetic samples in git.
 
-See [docs/privacy.md](docs/privacy.md).
+Details: [docs/privacy.md](docs/privacy.md).
 
-## Local data (not in git)
+## Local-only files
 
-Point the app at your export directory via environment config once tooling exists. Keep dumps, indexes, and `.env` on your machine only (covered by `.gitignore`).
+`.env`, dumps, and indexes stay on the machine (see `.gitignore`).
 
-## Roadmap (high level)
+## Next
 
-1. Ingest & clean exporter JSON → columnar cleaned messages  
-2. Persona card + embedding index  
-3. Local chat (prompt vs RAG)  
-4. Minimal A/B eval report  
+1. Clean layer; optional voice/ASR notes
+2. Persona card + embeddings
+3. Local chat + short eval writeup
 
 ## License
 
