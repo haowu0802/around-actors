@@ -1,0 +1,74 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+.idea/
+.vscode/
+*.code-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Local app data (never commit real corpora)
+data/raw/
+data/cleaned/
+data/features/
+data/assets/
+data/indexes/
+data/private/
+*.parquet
+!data/samples/**
+
+# Common export / dump patterns
+**/wx_export/
+**/*_export/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Secrets & credentials
+secrets/
+credentials*.json
+*.pem
+*.key
+
+# Model / embedding caches
+.cache/
+models/
+*.gguf
+*.bin
+!**/package-lock.json
+
+# Logs & reports with possible private snippets
+logs/
+*.log
+eval/reports/*
+!eval/reports/.gitkeep
+
+# Jupyter
+.ipynb_checkpoints/
