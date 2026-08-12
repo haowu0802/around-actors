@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "actor_key": "person_a",
+  "notes": "Example grounding suite. Real suites live under data/private/eval/.",
+  "cases": [
+    {
+      "id": "bio_answer_uses_facts",
+      "description": "Biographical why-question should retrieve structured facts.",
+      "turns": [
+        { "role": "user", "content": "Why no cardio lately?" }
+      ],
+      "checks": {
+        "fact_keys_must_any": ["no_cardio", "lumbar"],
+        "final_reply_abstain_or_grounded": true,
+        "grounded_any_from_facts": true,
+        "abstain_any": ["forget", "not sure", "unclear"],
+        "ungrounded_cause_patterns": ["car accident", "hit by a bus"]
+      }
+    }
+  ]
+}

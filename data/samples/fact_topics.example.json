@@ -1,0 +1,13 @@
+{
+  "actor_key": "person_a",
+  "notes": "Example topic specs for build_persona_facts.py --topics-file. Real actor files stay under data/private/fact_topics/.",
+  "topics": [
+    {
+      "fact_key": "example_habit",
+      "match_any": ["example phrase"],
+      "prefer_any": ["preferred short utterance"],
+      "min_len": 4,
+      "max_len": 60
+    }
+  ]
+}
