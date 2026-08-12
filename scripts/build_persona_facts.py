@@ -12,6 +12,7 @@ Language-specific topic match strings live in data/private/fact_topics/, not in 
 from __future__ import annotations
 
 import argparse
+import random
 import json
 import os
 import re
@@ -24,6 +25,23 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
+_SCRIPTS = Path(__file__).resolve().parent
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+from persona_store import (  # noqa: E402
+    add_fact_block,
+    ensure_governance_schema,
+    fact_candidate_to_dict,
+    list_fact_blocks,
+    list_fact_candidates,
+    list_topic_specs,
+    load_facts_pending_view,
+    remove_fact_block,
+    replace_fact_candidates,
+    set_fact_blocks,
+    upsert_fact_candidate,
+)
 WS_RE = re.compile(r"\s+")
 
 
@@ -46,9 +64,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--actor-key", required=True)
     p.add_argument(
         "--mode",
-        choices=("extract", "apply", "list", "set-status"),
+        choices=("extract", "apply", "list", "set-status", "db-list", "db-set-status", "db-delete"),
         default="extract",
-        help="extract|apply|list|set-status",
+        help="extract|apply|list|set-status|db-list|db-set-status|db-delete",
     )
     p.add_argument("--ensure-schema", action="store_true")
     p.add_argument("--evidence-limit", type=int, default=5)
@@ -65,6 +83,22 @@ def parse_args() -> argparse.Namespace:
         help="Keep candidates whose fact_key already exists as active (default: skip)",
     )
     p.add_argument(
+        "--include-rejected-keys",
+        action="store_true",
+        help="Re-extract fact_keys previously rejected in pending (default: skip)",
+    )
+    p.add_argument(
+        "--diversify",
+        action="store_true",
+        help="Pick statement randomly among top local matches (default: deterministic best)",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed used only with --diversify (0=time-based)",
+    )
+    p.add_argument(
         "--min-score",
         type=float,
         default=0.0,
@@ -73,12 +107,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--topics-file",
         default=None,
-        help="Topic specs JSON (default: data/private/fact_topics/<actor>.json)",
+        help="Optional topic specs JSON override for extract (default: stg.persona_topic_specs)",
     )
     p.add_argument(
         "--pending-file",
         default=None,
-        help="Pending JSON path (default: data/private/facts_pending/<actor>.json)",
+        help="Deprecated; fact pending now lives in Postgres",
     )
     p.add_argument(
         "--keys",
@@ -88,8 +122,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--status",
         default="",
-        choices=("", "pending", "approved", "rejected"),
-        help="Target status for --mode set-status",
+        choices=("", "pending", "approved", "rejected", "active", "inactive"),
+        help="Target status for set-status / db-set-status",
     )
     p.add_argument(
         "--replace-active",
@@ -100,28 +134,47 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def resolve_topics(repo_root: Path, actor_key: str, explicit: str | None) -> tuple[list[dict], Path]:
-    if explicit:
-        path = Path(explicit)
-    else:
-        path = repo_root / "data" / "private" / "fact_topics" / f"{actor_key}.json"
+def resolve_topics(
+    conn: psycopg.Connection,
+    actor_key: str,
+    topics_file: str | None = None,
+) -> list[dict]:
+    if topics_file:
+        path = Path(topics_file)
         if not path.is_file():
-            example = repo_root / "data" / "samples" / "fact_topics.example.json"
-            raise SystemExit(
-                f"No topics file for actor_key={actor_key!r}. "
-                f"Expected {path} (or pass --topics-file). See {example}"
-            )
-    data = json.loads(path.read_text(encoding="utf-8-sig"))
-    if isinstance(data, dict):
-        specs = data.get("topics") or []
+            raise SystemExit(f"topics file not found: {path}")
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        raw = data.get("topics") if isinstance(data, dict) else data
+        if not isinstance(raw, list) or not raw:
+            raise SystemExit(f"No topics found in {path}")
+        specs = [s for s in raw if isinstance(s, dict) and s.get("enabled", True)]
+        if not specs:
+            raise SystemExit(f"No enabled topics found in {path}")
+        source_label = str(path)
     else:
-        specs = data
-    if not isinstance(specs, list) or not specs:
-        raise SystemExit(f"No topics found in {path}")
-    return specs, path
+        specs = list_topic_specs(conn, actor_key, enabled_only=True)
+        source_label = "stg.persona_topic_specs"
+        if not specs:
+            raise SystemExit(
+                f"No enabled topics in {source_label} for actor_key={actor_key!r}. "
+                "Mine/approve/apply topics first, or pass --topics-file."
+            )
+    return [
+        {
+            "fact_key": s.get("fact_key"),
+            "kind": s.get("kind") or "preference",
+            "match_any": list(s.get("match_any") or []),
+            "prefer_any": list(s.get("prefer_any") or []),
+            "min_len": int(s.get("min_len") or 4),
+            "max_len": int(s.get("max_len") or 80),
+            "_source": source_label,
+        }
+        for s in specs
+    ]
 
 
 def default_pending_path(repo_root: Path, actor_key: str) -> Path:
+    # Legacy path kept for migrate/import only; runtime uses Postgres.
     return repo_root / "data" / "private" / "facts_pending" / f"{actor_key}.json"
 
 
@@ -129,6 +182,7 @@ def ensure_schema(conn: psycopg.Connection, repo_root: Path) -> None:
     ddl = (repo_root / "sql" / "004_stg_persona_facts.sql").read_text(encoding="utf-8")
     with conn.cursor() as cur:
         cur.execute(ddl)
+    ensure_governance_schema(conn, repo_root)
     conn.commit()
 
 
@@ -155,16 +209,36 @@ def text_overlap_ratio(a: str, b: str) -> float:
 
 
 def fetch_active_facts(conn: psycopg.Connection, actor_key: str) -> list[dict]:
+    return fetch_facts(conn, actor_key, status="active")
+
+
+def fetch_facts(
+    conn: psycopg.Connection,
+    actor_key: str,
+    status: str | None = None,
+) -> list[dict]:
     with conn.cursor() as cur:
         try:
-            cur.execute(
-                """
-                SELECT fact_key, statement
-                FROM stg.persona_facts
-                WHERE actor_key = %s AND status = 'active'
-                """,
-                (actor_key,),
-            )
+            if status:
+                cur.execute(
+                    """
+                    SELECT id, fact_key, statement, confidence, status, source, updated_at
+                    FROM stg.persona_facts
+                    WHERE actor_key = %s AND status = %s
+                    ORDER BY fact_key
+                    """,
+                    (actor_key, status),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, fact_key, statement, confidence, status, source, updated_at
+                    FROM stg.persona_facts
+                    WHERE actor_key = %s
+                    ORDER BY status, fact_key
+                    """,
+                    (actor_key,),
+                )
             return list(cur.fetchall())
         except Exception:
             try:
@@ -172,6 +246,40 @@ def fetch_active_facts(conn: psycopg.Connection, actor_key: str) -> list[dict]:
             except Exception:
                 pass
             return []
+
+
+def set_fact_status(
+    conn: psycopg.Connection,
+    actor_key: str,
+    fact_key: str,
+    status: str,
+) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE stg.persona_facts
+            SET status = %s, updated_at = now()
+            WHERE actor_key = %s AND fact_key = %s
+            """,
+            (status, actor_key, fact_key),
+        )
+        n = cur.rowcount
+    conn.commit()
+    return n > 0
+
+
+def delete_fact(conn: psycopg.Connection, actor_key: str, fact_key: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM stg.persona_facts
+            WHERE actor_key = %s AND fact_key = %s
+            """,
+            (actor_key, fact_key),
+        )
+        n = cur.rowcount
+    conn.commit()
+    return n > 0
 
 
 def fetch_candidates(
@@ -278,7 +386,13 @@ def score_candidate(
     return score, parts
 
 
-def pick_statement(rows: list[dict], prefer_any: list[str]) -> tuple[str, list[int], int | None]:
+def pick_statement(
+    rows: list[dict],
+    prefer_any: list[str],
+    *,
+    diversify: bool = False,
+    rng: random.Random | None = None,
+) -> tuple[str, list[int], int | None]:
     if not rows:
         return "", [], None
     scored: list[tuple[float, dict]] = []
@@ -299,7 +413,11 @@ def pick_statement(rows: list[dict], prefer_any: list[str]) -> tuple[str, list[i
             local -= 0.5
         scored.append((local, r))
     scored.sort(key=lambda x: (-x[0], -(x[1].get("create_time_epoch") or 0)))
-    best = scored[0][1]
+    if diversify and rng is not None and len(scored) > 1:
+        top_n = min(3, len(scored))
+        best = rng.choice([r for _, r in scored[:top_n]])
+    else:
+        best = scored[0][1]
     evidence_ids = [int(r["id"]) for _, r in scored[:5]]
     statement = (best["text_content"] or "").strip().replace("\n", " ")
     if len(statement) > 120:
@@ -353,29 +471,37 @@ def cmd_extract(
     *,
     actor_key: str,
     topics: list[dict],
-    topics_path: Path,
-    pending_path: Path,
     evidence_limit: int,
     limit: int,
     since_days: int,
     include_active_keys: bool,
+    include_rejected_keys: bool,
     min_score: float,
+    diversify: bool,
+    seed: int,
     dry_run: bool,
 ) -> int:
-    prior = load_pending(pending_path)
+    prior = load_facts_pending_view(conn, actor_key)
     prior_status: dict[str, str] = {}
+    blocked_keys: set[str] = set(str(x) for x in (prior.get("blocked_fact_keys") or []))
     for c in prior.get("candidates") or []:
         key = f"{c.get('fact_key')}||{c.get('statement')}"
         st = c.get("status")
+        fk = str(c.get("fact_key") or "")
         if st in {"approved", "rejected", "applied"}:
             prior_status[key] = st
+        if st == "rejected" and fk:
+            blocked_keys.add(fk)
+    blocked_keys |= list_fact_blocks(conn, actor_key)
 
     active_facts = fetch_active_facts(conn, actor_key)
     active_keys = {str(a.get("fact_key") or "") for a in active_facts}
     now_epoch = int(time.time())
     min_epoch = now_epoch - since_days * 86400 if since_days > 0 else None
+    rng = random.Random(seed if seed else now_epoch)
 
     skipped_active = 0
+    skipped_rejected = 0
     skipped_low = 0
     candidates: list[dict[str, Any]] = []
     for spec in topics:
@@ -385,6 +511,10 @@ def cmd_extract(
         if not include_active_keys and fact_key in active_keys:
             print(f"SKIP {fact_key}: already active")
             skipped_active += 1
+            continue
+        if not include_rejected_keys and fact_key in blocked_keys:
+            print(f"SKIP {fact_key}: previously rejected (blocked)")
+            skipped_rejected += 1
             continue
         rows = fetch_candidates(
             conn,
@@ -396,7 +526,9 @@ def cmd_extract(
             min_epoch,
         )
         prefer = list(spec.get("prefer_any") or [])
-        statement, evidence_ids, ts = pick_statement(rows, prefer)
+        statement, evidence_ids, ts = pick_statement(
+            rows, prefer, diversify=diversify, rng=rng
+        )
         if not statement or not evidence_ids:
             print(f"SKIP {fact_key}: no evidence")
             continue
@@ -417,6 +549,11 @@ def cmd_extract(
             continue
         status_key = f"{fact_key}||{statement}"
         status = prior_status.get(status_key, "pending")
+        if status == "rejected" and not include_rejected_keys:
+            print(f"SKIP {fact_key}: exact statement was rejected")
+            skipped_rejected += 1
+            blocked_keys.add(fact_key)
+            continue
         item = {
             "id": f"{actor_key}-{fact_key}",
             "op": "upsert",
@@ -440,52 +577,52 @@ def cmd_extract(
     if limit > 0:
         candidates = candidates[:limit]
 
-    if not candidates:
-        print(
-            f"extract_done actor_key={actor_key} candidates=0 "
-            f"skipped_active={skipped_active} skipped_low={skipped_low} "
-            "(kept existing pending file if any)"
-        )
-        if prior.get("candidates") and not dry_run:
-            print(f"pending_file={pending_path} (unchanged)")
-        return 0
-
-    payload = {
-        "version": 2,
-        "actor_key": actor_key,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "topics_file": str(topics_path),
+    run_meta = {
         "limit": limit,
         "since_days": since_days,
         "min_score": min_score,
+        "diversify": diversify,
         "skipped_active_keys": skipped_active,
+        "skipped_rejected_keys": skipped_rejected,
         "skipped_low_score": skipped_low,
         "active_fact_keys": sorted(active_keys),
-        "candidates": candidates,
-        "notes": (
-            "Set status via --mode set-status --keys a,b --status approved "
-            "then --mode apply"
-        ),
     }
+
+    if not candidates:
+        if not dry_run:
+            set_fact_blocks(conn, actor_key, blocked_keys)
+            conn.commit()
+        print(
+            f"extract_done actor_key={actor_key} candidates=0 "
+            f"skipped_active={skipped_active} skipped_rejected={skipped_rejected} "
+            f"skipped_low={skipped_low} storage=postgres"
+        )
+        return 0
+
     if dry_run:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print(json.dumps({"candidates": candidates, "meta": run_meta}, ensure_ascii=False, indent=2))
     else:
-        write_pending(pending_path, payload)
-        print(f"pending_file={pending_path}")
+        set_fact_blocks(conn, actor_key, blocked_keys)
+        replace_fact_candidates(conn, actor_key, candidates, run_meta=run_meta)
+        conn.commit()
+        print("storage=postgres table=stg.persona_fact_candidates")
     print(
         f"extract_done actor_key={actor_key} candidates={len(candidates)} "
-        f"skipped_active={skipped_active} skipped_low={skipped_low}"
+        f"skipped_active={skipped_active} skipped_rejected={skipped_rejected} "
+        f"skipped_low={skipped_low}"
     )
     return 0
 
 
-def cmd_list(pending_path: Path) -> int:
-    data = load_pending(pending_path)
-    if not data:
-        print(f"No pending file: {pending_path}")
+
+def cmd_list(conn: psycopg.Connection, actor_key: str) -> int:
+    data = load_facts_pending_view(conn, actor_key)
+    cands = data.get("candidates") or []
+    if not cands:
+        print(f"No pending fact candidates for actor_key={actor_key}")
         return 1
-    print(f"pending_file={pending_path} actor_key={data.get('actor_key')}")
-    for c in data.get("candidates") or []:
+    print(f"storage=postgres actor_key={actor_key}")
+    for c in cands:
         bd = c.get("score_breakdown") or {}
         print(
             f"  [{c.get('status')}] score={c.get('score')} "
@@ -496,7 +633,9 @@ def cmd_list(pending_path: Path) -> int:
     return 0
 
 
-def cmd_set_status(pending_path: Path, keys_csv: str, status: str, dry_run: bool) -> int:
+def cmd_set_status(
+    conn: psycopg.Connection, actor_key: str, keys_csv: str, status: str, dry_run: bool
+) -> int:
     if not status:
         print("--status is required for set-status", file=sys.stderr)
         return 2
@@ -504,23 +643,27 @@ def cmd_set_status(pending_path: Path, keys_csv: str, status: str, dry_run: bool
     if not keys:
         print("--keys is required (comma-separated fact_key)", file=sys.stderr)
         return 2
-    data = load_pending(pending_path)
-    if not data:
-        print(f"No pending file: {pending_path}", file=sys.stderr)
-        return 2
     keyset = set(keys)
     n = 0
-    for c in data.get("candidates") or []:
-        if c.get("fact_key") in keyset:
-            print(f"SET {c.get('fact_key')}: {c.get('status')} -> {status}")
-            if not dry_run:
-                c["status"] = status
-            n += 1
+    for row in list_fact_candidates(conn, actor_key):
+        fk = str(row.get("fact_key") or "")
+        if fk not in keyset:
+            continue
+        c = fact_candidate_to_dict(row)
+        print(f"SET {fk}: {c.get('status')} -> {status}")
+        if not dry_run:
+            c["status"] = status
+            upsert_fact_candidate(conn, actor_key, c)
+            if status == "rejected":
+                add_fact_block(conn, actor_key, fk)
+            elif status in {"pending", "approved"}:
+                remove_fact_block(conn, actor_key, fk)
+        n += 1
     if n == 0:
         print(f"No matching keys in pending: {sorted(keyset)}", file=sys.stderr)
         return 1
     if not dry_run:
-        write_pending(pending_path, data)
+        conn.commit()
     print(f"set_status_done updated={n} status={status}")
     return 0
 
@@ -529,21 +672,10 @@ def cmd_apply(
     conn: psycopg.Connection,
     *,
     actor_key: str,
-    pending_path: Path,
     replace_active: bool,
     dry_run: bool,
 ) -> int:
-    data = load_pending(pending_path)
-    if not data:
-        print(f"No pending file: {pending_path}", file=sys.stderr)
-        return 2
-    if data.get("actor_key") and data["actor_key"] != actor_key:
-        print(
-            f"Pending actor_key={data.get('actor_key')!r} != --actor-key {actor_key!r}",
-            file=sys.stderr,
-        )
-        return 2
-
+    data = load_facts_pending_view(conn, actor_key)
     approved = [c for c in (data.get("candidates") or []) if c.get("status") == "approved"]
     if not approved:
         print("No candidates with status=approved", file=sys.stderr)
@@ -571,12 +703,12 @@ def cmd_apply(
         if not dry_run:
             upsert_fact(conn, actor_key, fact_key, statement, evidence_ids, conf, source)
             c["status"] = "applied"
+            upsert_fact_candidate(conn, actor_key, c)
         applied += 1
 
     if not dry_run:
         conn.commit()
-        write_pending(pending_path, data)
-    print(f"apply_done actor_key={actor_key} applied={applied} pending_file={pending_path}")
+    print(f"apply_done actor_key={actor_key} applied={applied} storage=postgres")
     return 0
 
 
@@ -590,46 +722,98 @@ def main() -> int:
     load_dotenv(repo_root / ".env")
     args = parse_args()
 
-    pending_path = (
-        Path(args.pending_file)
-        if args.pending_file
-        else default_pending_path(repo_root, args.actor_key)
-    )
-
-    if args.mode == "list":
-        return cmd_list(pending_path)
-    if args.mode == "set-status":
-        return cmd_set_status(pending_path, args.keys, args.status, args.dry_run)
-
     if not args.database_url:
         print("Missing --database-url or DATABASE_URL", file=sys.stderr)
         return 2
 
-    topics, topics_path = resolve_topics(repo_root, args.actor_key, args.topics_file)
-
     with psycopg.connect(args.database_url, row_factory=dict_row) as conn:
-        if args.ensure_schema:
+        if args.ensure_schema or args.mode in {
+            "extract",
+            "apply",
+            "list",
+            "set-status",
+            "db-list",
+            "db-set-status",
+            "db-delete",
+        }:
             ensure_schema(conn, repo_root)
+
+        if args.mode == "list":
+            return cmd_list(conn, args.actor_key)
+        if args.mode == "set-status":
+            return cmd_set_status(
+                conn, args.actor_key, args.keys, args.status, args.dry_run
+            )
+
+        if args.mode == "db-list":
+            rows = fetch_facts(conn, args.actor_key, status=None)
+            for r in rows:
+                print(
+                    f"[{r.get('status')}] {r.get('fact_key')}: "
+                    f"{(r.get('statement') or '')[:80]!r} conf={r.get('confidence')}"
+                )
+            print(f"db_list_done n={len(rows)}")
+            return 0
+
+        if args.mode == "db-set-status":
+            if args.status not in {"active", "inactive"}:
+                print("db-set-status requires --status active|inactive", file=sys.stderr)
+                return 2
+            keys = [k.strip() for k in args.keys.split(",") if k.strip()]
+            if not keys:
+                print("--keys required", file=sys.stderr)
+                return 2
+            n = 0
+            for k in keys:
+                if args.dry_run:
+                    print(f"DRY {k} -> {args.status}")
+                elif set_fact_status(conn, args.actor_key, k, args.status):
+                    print(f"SET DB {k} -> {args.status}")
+                    n += 1
+                else:
+                    print(f"MISS {k}", file=sys.stderr)
+            print(f"db_set_status_done updated={n}")
+            return 0 if n or args.dry_run else 1
+
+        if args.mode == "db-delete":
+            keys = [k.strip() for k in args.keys.split(",") if k.strip()]
+            if not keys:
+                print("--keys required", file=sys.stderr)
+                return 2
+            n = 0
+            for k in keys:
+                if args.dry_run:
+                    print(f"DRY DELETE {k}")
+                elif delete_fact(conn, args.actor_key, k):
+                    print(f"DELETE DB {k}")
+                    n += 1
+                else:
+                    print(f"MISS {k}", file=sys.stderr)
+            print(f"db_delete_done deleted={n}")
+            return 0 if n or args.dry_run else 1
+
         if args.mode == "extract":
-            print(f"topics_file={topics_path} topics_n={len(topics)}")
+            topics = resolve_topics(conn, args.actor_key, args.topics_file)
+            src = (topics[0].get("_source") if topics else "none")
+            print(f"topics_n={len(topics)} topics_source={src}")
             return cmd_extract(
                 conn,
                 actor_key=args.actor_key,
                 topics=topics,
-                topics_path=topics_path,
-                pending_path=pending_path,
                 evidence_limit=args.evidence_limit,
                 limit=args.limit,
                 since_days=args.since_days,
                 include_active_keys=args.include_active_keys,
+                include_rejected_keys=args.include_rejected_keys,
                 min_score=args.min_score,
+                diversify=args.diversify,
+                seed=args.seed,
                 dry_run=args.dry_run,
             )
         if args.mode == "apply":
             return cmd_apply(
                 conn,
                 actor_key=args.actor_key,
-                pending_path=pending_path,
                 replace_active=args.replace_active,
                 dry_run=args.dry_run,
             )

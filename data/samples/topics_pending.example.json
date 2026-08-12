@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "actor_key": "person_a",
+  "notes": "Example topics_pending file. Real files: data/private/topics_pending/<actor>.json",
+  "candidates": [
+    {
+      "id": "person_a-draft_example",
+      "op": "upsert_topic",
+      "fact_key": "draft_example",
+      "kind": "preference",
+      "phrase": "example phrase",
+      "match_any": ["example phrase"],
+      "prefer_any": ["example phrase"],
+      "min_len": 4,
+      "max_len": 80,
+      "hit_count": 12,
+      "example_message_ids": [],
+      "example_excerpts": ["example phrase showed up in chat"],
+      "score": 70.0,
+      "status": "pending",
+      "source": "topic_mine_v1",
+      "enabled": true
+    }
+  ]
+}

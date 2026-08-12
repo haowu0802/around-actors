@@ -455,15 +455,14 @@ def main() -> int:
             return 2
 
     modes = parse_modes(args.modes)
-    card_path = resolve_persona_card_path(repo_root, actor_key, args.persona_card)
-    card = load_persona_card(card_path) if card_path and card_path.is_file() else None
-    display_name = args.display_name or (card or {}).get("display_name") or actor_key
+    card = None
+    card_src = "none"
+    display_name = args.display_name or actor_key
 
     report_dir = Path(args.report_dir) if args.report_dir else repo_root / "eval" / "reports"
 
     print(f"suite={suite_path}")
     print(f"actor_key={actor_key} cases={len(cases)} modes={[m.name for m in modes]}")
-    print(f"persona_card={card_path if card else 'none'}")
     print(f"report_dir={report_dir}")
 
     if args.dry_run:
@@ -484,6 +483,14 @@ def main() -> int:
     started = time.time()
 
     with psycopg.connect(args.database_url, row_factory=dict_row) as conn:
+        from chat_persona import load_persona_card_for_actor
+
+        card, card_src = load_persona_card_for_actor(
+            conn, repo_root, actor_key, args.persona_card
+        )
+        if card and card.get("display_name") and not args.display_name:
+            display_name = str(card["display_name"]).strip() or display_name
+        print(f"persona_card={card_src}")
         style_lines = fetch_style_lines_stable(
             conn, actor_key, args.sample_size, args.min_len, args.max_len
         )
@@ -542,7 +549,7 @@ def main() -> int:
         "elapsed_sec": round(time.time() - started, 2),
         "actor_key": actor_key,
         "suite": str(suite_path),
-        "persona_card": str(card_path) if card else None,
+        "persona_card": card_src if card else None,
         "model": model,
         "kobold_url": args.kobold_url,
         "temperature": args.temperature,

@@ -1,0 +1,4 @@
+{
+  "notes": "Optional stop phrases for scripts/build_persona_topics.py. Copy to data/private/topic_mine/stopwords.json and extend. Keep real language lists private.",
+  "stopwords": ["the", "and", "you", "for", "with"]
+}

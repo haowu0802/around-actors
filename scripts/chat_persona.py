@@ -137,6 +137,35 @@ def load_persona_card(path: Path) -> dict[str, Any]:
     return data
 
 
+def load_persona_card_for_actor(
+    conn: psycopg.Connection,
+    repo_root: Path,
+    actor_key: str,
+    explicit: str | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Load persona card. Explicit --persona-card path wins; else Postgres; else default JSON."""
+    if explicit:
+        path = Path(explicit)
+        if not path.is_file():
+            raise FileNotFoundError(str(path))
+        return load_persona_card(path), str(path)
+    try:
+        from persona_store import ensure_governance_schema, load_persona_card_db
+
+        ensure_governance_schema(conn, repo_root)
+        card = load_persona_card_db(conn, actor_key)
+        if card:
+            return card, "postgres"
+    except Exception:
+        pass
+    path = resolve_persona_card_path(repo_root, actor_key, None)
+    if path is None:
+        return None, "none"
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    return load_persona_card(path), str(path)
+
+
 def _bullet_block(items: list[Any] | None, empty: str = "") -> str:
     lines = []
     for item in items or []:
@@ -508,22 +537,20 @@ def main() -> int:
     display_name = args.display_name or args.actor_key
     user_label = str(locale.get("cli_user_label") or "you")
     card: dict[str, Any] | None = None
-    card_path: Path | None = None
-    if not args.no_persona_card:
-        card_path = resolve_persona_card_path(repo_root, args.actor_key, args.persona_card)
-        if card_path is not None:
-            if not card_path.is_file():
-                print(f"Persona card not found: {card_path}", file=sys.stderr)
-                return 2
-            try:
-                card = load_persona_card(card_path)
-            except Exception as e:
-                print(f"Failed to load persona card {card_path}: {e}", file=sys.stderr)
-                return 2
-            if card.get("display_name") and not args.display_name:
-                display_name = str(card["display_name"]).strip() or display_name
+    card_src = "none"
 
     with psycopg.connect(args.database_url, row_factory=dict_row) as conn:
+        if not args.no_persona_card:
+            try:
+                card, card_src = load_persona_card_for_actor(
+                    conn, repo_root, args.actor_key, args.persona_card
+                )
+            except Exception as e:
+                print(f"Failed to load persona card: {e}", file=sys.stderr)
+                return 2
+            if card and card.get("display_name") and not args.display_name:
+                display_name = str(card["display_name"]).strip() or display_name
+
         style_lines = fetch_style_lines(
             conn,
             args.actor_key,
@@ -537,7 +564,7 @@ def main() -> int:
             print(system_prompt)
             print(
                 f"\n# style_lines={len(style_lines)} actor_key={args.actor_key} "
-                f"rag={args.rag} facts={args.facts} persona_card={card_path or 'none'} "
+                f"rag={args.rag} facts={args.facts} persona_card={card_src} "
                 f"locale={locale_path}"
             )
             return 0
@@ -601,7 +628,7 @@ def main() -> int:
         print(
             f"actor_key={args.actor_key} display_name={display_name} "
             f"style_lines={len(style_lines)} rag={args.rag} facts={args.facts} "
-            f"rag_k={args.rag_k} fact_k={args.fact_k} persona_card={card_path or 'none'} "
+            f"rag_k={args.rag_k} fact_k={args.fact_k} persona_card={card_src} "
             f"locale={locale_path.name}"
         )
         print(f"kobold={args.kobold_url} model={model}")
