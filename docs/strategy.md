@@ -15,25 +15,26 @@ Three **channels** (do not mix):
 
 | Channel | What | Store | Human gate |
 |---------|------|-------|------------|
-| **Topics** | Schema slots to mine facts into | `stg.persona_topic_specs` (+ candidates/blocks) | Topics tab / CLI |
+| **Topics** | Schema slots to mine facts into | `stg.persona_topic_specs` (+ candidates) | LLM propose → Approve/Redo/Reject; official Disable/Delete |
 | **Facts** | Normalized propositions | `stg.persona_facts` (+ fact candidates/blocks) | Facts tab / CLI |
-| **Voice / style** | How they speak (not what is true) | `stg.persona_cards` + style samples (planned) | Voice tab (planned) |
+| **Voice / style** | How they speak (not what is true) | `stg.persona_cards` + style samples | Voice tab |
 | **Episodic** | Chat snippets on demand | `stg.messages` via RAG | None (retrieval) |
 
 ```text
 stg.messages
     │
-    ├─► Topics mine ──approve──► persona_topic_specs
+    ├─► Topics LLM propose-one (time-bucket window) ──Approve──► persona_topic_specs
     │         │
     │         └─► Facts extract ──approve──► persona_facts
     │
-    ├─► Habit / glue phrases ──► STOP (block topic&fact mine)
-    │                         └─► Voice markers (style only; never facts)
+    ├─► Style / voice markers ──► Voice channel only (never topics/facts)
     │
     ├─► Style samples + voice_notes ──► chat prompt (tone)
     │
     └─► Keyword RAG (→ hybrid later)
 ```
+
+**Topics populate (agreed):** Local Kobold reads one random session window (month-bucketed). Returns 0–1 pending slot. Human Approve / Redo / Reject only — no manual field edits, no n-gram stop mine as the discovery path. Rejected rows stay as reject-memory for later prompts. Official: Disable / Delete.
 
 **Intake Q&A** (planned): fill chat-absent profile slots; writes the **same** facts table with `source=human_intake|qa_llm_draft` and empty evidence allowed.
 
@@ -42,21 +43,13 @@ Governance runtime data lives in Postgres (`sql/005_persona_governance.sql`).
 
 ### Habit phrases vs topics (agreed)
 
-Industry practice (Letta persona vs archival, style profiling vs RAG facts): 
+- High-DF discourse glue is **not a topic**.
+- With LLM topic propose, glue is filtered by the model + human Reject (reject-memory), not by a stop-phrase mine.
+- Relative style (bubble length, sticker density, laugh rate) belongs in **Voice**, never in `fact_key` rows.
 
-- High-DF discourse glue (`不是` / `就是` / `我觉得`…) is **not a topic**.
-- It is either **stop/block** for topic&fact extract, or a **voice marker** for style.
-- Shared Mandarin glue barely distinguishes actors; **relative** style (bubble length, sticker density, laugh rate) does — e.g. xi heavy WeChat stickers + longer bubbles vs guodahong shorter bubbles + almost no stickers.
+### Stop / block
 
-Never create `fact_key` rows for speech habits.
-
-### Stop / block (planned implementation)
-
-Semi-manual, **lighter** than topics (no English fact_key required; phrase is the key).
-
-1. **MVP:** Topic Reject → one-click **Add as stop** → `persona_topic_blocks` (and/or dedicated stop table) consumed by topic&fact mine.
-2. **Later:** optional Stop mine queue (high-DF candidates) with labels: `stop` | `voice_marker` | `discard`.
-3. Stops are actor-scoped (and optionally shared locale lists under `data/private/`).
+Legacy `persona_topic_blocks` / n-gram extract may remain in code for debugging but are **retired from the Topics UX**. Do not reintroduce stop-mining as the primary topic path.
 
 ### Voice / style (planned implementation)
 
@@ -127,15 +120,15 @@ evidence → draft_statement (LLM or template) → human approve → DB statemen
 - Persona chat: style samples + keyword RAG + facts + locale + **Postgres persona cards**
 - Facts pending / apply / Streamlit Facts tab (**Postgres** `persona_fact_candidates`)
 - Topics mine / approve / apply / Streamlit Topics tab (**Postgres** `persona_topic_*`)
+- Topics LLM propose-one (Kobold) + Approve/Redo/Reject; official Disable/Delete
 - Governance DDL + JSON→PG import: `sql/005_persona_governance.sql`, `migrate_private_json_to_pg.py`
 - Rejected-key blocking; optional diversify; LoRA pair export (train optional)
 
-### Phase V — Voice & stops (in progress)
+### Phase V — Voice & LLM topics (in progress)
 
-- Stop/block MVP: Reject as stop + promote-pending-to-stops; mine consumes blocks as stopwords
-- Topic mine hardened: `max_df_ratio` + `max_hits` drop habit glue; min phrase length 3
+- Topics populate: Kobold propose-one from time-bucketed random windows; Approve / Redo / Reject; official Disable / Delete
+- n-gram topic mine + stop UX retired from primary path (legacy CLI only)
 - Voice tab: metrics + voice_notes on `stg.persona_cards` (+ style sample peek)
-- Optional later: dedicated Stop mine queue with `stop|voice_marker|discard` labels
 
 ### Phase F — Facts maturation
 

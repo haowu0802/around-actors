@@ -7,6 +7,7 @@ English UI labels only. Run:
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -32,25 +33,19 @@ from build_persona_facts import (  # noqa: E402
 )
 from build_persona_topics import (  # noqa: E402
     cmd_apply as topics_cmd_apply,
-    cmd_extract as topics_cmd_extract,
-    cmd_promote_pending_to_stops,
-    load_stopwords,
-    normalize_phrase,
+    cmd_llm_propose_one,
 )
 from persona_store import (  # noqa: E402
     add_fact_block,
-    add_topic_block,
-    delete_topic_candidate,
+    delete_topic_spec,
     ensure_governance_schema,
     fact_candidate_to_dict,
     list_persona_card_actors,
-    list_topic_blocks,
     list_topic_specs,
     load_facts_pending_view,
     load_persona_card_db,
     load_topics_pending_view,
     remove_fact_block,
-    remove_topic_block,
     set_topic_spec_enabled,
     upsert_fact_candidate,
     upsert_persona_card,
@@ -98,13 +93,17 @@ def _load_evidence_map(conn, ids: list[int]) -> dict[int, str]:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT id, left(text_content, 160) AS t
+            SELECT id, speaker_role, left(text_content, 240) AS t
             FROM stg.messages
             WHERE id = ANY(%s)
             """,
             (ids,),
         )
-        return {int(r["id"]): (r["t"] or "") for r in cur.fetchall()}
+        out: dict[int, str] = {}
+        for r in cur.fetchall():
+            role = str(r.get("speaker_role") or "?")
+            out[int(r["id"])] = f"[{role}] {r['t'] or ''}"
+        return out
 
 
 def _render_fact_candidates(data: dict[str, Any], conn, actor_key: str) -> None:
@@ -201,139 +200,144 @@ def _render_db_facts(conn, actor_key: str) -> None:
 def _render_topic_candidates(data: dict[str, Any], conn, actor_key: str) -> None:
     cands = list(data.get("candidates") or [])
     if not cands:
-        st.info("No topic candidates in Postgres queue.")
+        st.info("No topic candidates yet. Click Propose one topic.")
         return
 
     all_ids: list[int] = []
     for c in cands:
         all_ids.extend(int(x) for x in (c.get("example_message_ids") or []))
+        meta = c.get("meta") if isinstance(c.get("meta"), dict) else {}
+        # Load full window texts for review (not only the first 20).
+        all_ids.extend(int(x) for x in (meta.get("window_ids") or []))
     evid = _load_evidence_map(conn, sorted(set(all_ids)))
 
+    pending = [c for c in cands if str(c.get("status") or "") == "pending"]
+    other = [c for c in cands if str(c.get("status") or "") != "pending"]
+
     st.caption(
-        f"Generated: {data.get('generated_at', '?')} · storage={data.get('storage')} · "
-        f"scanned={data.get('messages_scanned', '?')} · "
-        f"skipped_existing={data.get('skipped_existing', '?')} · "
-        f"candidates={len(cands)}"
+        f"storage={data.get('storage')} · pending={len(pending)} · other={len(other)} · "
+        f"last_mode={(data.get('mode') or data.get('last_result') or '?')}"
     )
 
-    for i, c in enumerate(cands):
+    def _render_one(c: dict[str, Any], i: int, *, expanded: bool) -> None:
         key = str(c.get("fact_key") or f"topic-{i}")
         status = str(c.get("status") or "pending")
-        phrase = str(c.get("phrase") or "")
+        meta = c.get("meta") if isinstance(c.get("meta"), dict) else {}
+        title = str(meta.get("title_zh") or c.get("phrase") or key)
         with st.expander(
-            f"[{status}] score={c.get('score')} hits={c.get('hit_count')} · {key} · {phrase[:32]}",
-            expanded=(status == "pending"),
+            f"[{status}] {title} · kind={c.get('kind')} · score={c.get('score')}",
+            expanded=expanded,
         ):
-            new_key = st.text_input("fact_key", value=key, key=f"tk-{key}-{i}")
-            kind = st.selectbox(
-                "kind",
-                options=["profile", "preference", "episode"],
-                index=["profile", "preference", "episode"].index(
-                    c.get("kind")
-                    if c.get("kind") in ("profile", "preference", "episode")
-                    else "preference"
-                ),
-                key=f"kind-{key}-{i}",
+            st.json(
+                {
+                    "fact_key": key,
+                    "kind": c.get("kind"),
+                    "match_any": c.get("match_any"),
+                    "prefer_any": c.get("prefer_any"),
+                    "why": meta.get("why"),
+                    "confidence": meta.get("confidence"),
+                    "bucket": meta.get("bucket"),
+                    "source": c.get("source"),
+                }
             )
-            match_raw = st.text_area(
-                "match_any (one per line)",
-                value="\n".join(str(x) for x in (c.get("match_any") or [])),
-                key=f"match-{key}-{i}",
-                height=80,
-            )
-            prefer_raw = st.text_area(
-                "prefer_any (one per line)",
-                value="\n".join(str(x) for x in (c.get("prefer_any") or [])),
-                key=f"pref-{key}-{i}",
-                height=80,
-            )
-            for mid in c.get("example_message_ids") or []:
-                mid_i = int(mid)
-                st.markdown(f"- `{mid_i}`: {evid.get(mid_i, '(missing)')}")
+            st.caption("Evidence message ids (LLM-picked)")
+            evid_ids = [int(x) for x in (c.get("example_message_ids") or [])]
+            if evid_ids:
+                for mid_i in evid_ids:
+                    st.markdown(f"- `{mid_i}`: {evid.get(mid_i, '(missing)')}")
+            else:
+                st.write("(none)")
 
-            def _persist_edits() -> dict[str, Any]:
+            window_ids = [int(x) for x in (meta.get("window_ids") or [])]
+            st.caption(
+                f"Full chat window sent to LLM (n={len(window_ids)}, bucket={meta.get('bucket') or '?'})"
+            )
+            if window_ids:
+                # Show the whole window (role + text); scroll via expander if long.
+                with st.expander("Window transcript", expanded=False):
+                    for mid_i in window_ids:
+                        st.markdown(f"- `{mid_i}`: {evid.get(mid_i, '(missing)')}")
+            else:
+                st.warning("No window_ids stored on this candidate; Redo may sample a new window.")
+
+            if status != "pending":
+                return
+
+            st.text_input(
+                "Optional redo feedback",
+                key=f"topic-fb-{key}-{i}",
+                placeholder="Why this proposal is wrong (sent on Redo)",
+            )
+            cols = st.columns(3)
+            if cols[0].button("Approve", type="primary", key=f"topic-apr-{key}-{i}"):
                 out = dict(c)
-                out["fact_key"] = new_key.strip() or key
-                out["kind"] = kind
-                out["match_any"] = [ln.strip() for ln in match_raw.splitlines() if ln.strip()]
-                out["prefer_any"] = [ln.strip() for ln in prefer_raw.splitlines() if ln.strip()]
-                if out["match_any"]:
-                    out["phrase"] = out["match_any"][0]
-                return out
-
-            def _save_candidate(out: dict[str, Any]) -> None:
-                new_fk = str(out.get("fact_key") or "")
-                old_fk = str(c.get("fact_key") or key)
+                out["status"] = "approved"
                 upsert_topic_candidate(conn, actor_key, out)
-                if old_fk and new_fk and old_fk != new_fk:
-                    delete_topic_candidate(conn, actor_key, old_fk)
-                    # Move block key if the old draft key was blocked.
-                    remove_topic_block(conn, actor_key, "fact_key", old_fk)
-
-            cols = st.columns(5)
-            if cols[0].button("Save edits", key=f"topic-save-{key}-{i}"):
-                _save_candidate(_persist_edits())
                 conn.commit()
-                st.rerun()
-            if cols[1].button("Approve", key=f"topic-apr-{key}-{i}"):
-                out = _persist_edits()
-                out["status"] = "approved"
-                _save_candidate(out)
-                remove_topic_block(conn, actor_key, "fact_key", out["fact_key"])
-                conn.commit()
-                st.rerun()
-            if cols[2].button(
-                "Apply this",
-                key=f"topic-apply-{key}-{i}",
-                disabled=(status != "approved"),
-                help="Write this approved topic into official specs (single apply).",
-            ):
-                out = _persist_edits()
-                out["status"] = "approved"
-                _save_candidate(out)
-                remove_topic_block(conn, actor_key, "fact_key", out["fact_key"])
-                conn.commit()
-                topics_cmd_apply(
+                code = topics_cmd_apply(
                     conn,
                     actor_key=actor_key,
                     dry_run=False,
-                    fact_keys=[str(out["fact_key"])],
+                    fact_keys=[key],
                 )
+                if code != 0:
+                    st.warning(f"Approve apply failed: {code}")
                 st.rerun()
-            if cols[3].button("Reject as stop", key=f"topic-rej-{key}-{i}"):
-                out = _persist_edits()
+            if cols[1].button("Redo with LLM", key=f"topic-redo-{key}-{i}"):
+                # Same window when stored; otherwise falls back to a new random window.
+                redo_ids = [int(x) for x in (meta.get("window_ids") or []) if x]
+                with st.spinner("Redoing topic with LLM..."):
+                    code, info = cmd_llm_propose_one(
+                        conn,
+                        actor_key=actor_key,
+                        kobold_url=st.session_state.get(
+                            "t_kobold",
+                            os.environ.get("KOBOLD_URL", "http://127.0.0.1:5001/v1"),
+                        ),
+                        model=st.session_state.get("t_model", ""),
+                        gap_sec=int(st.session_state.get("t_gap", 3 * 3600)),
+                        max_window_msgs=int(st.session_state.get("t_maxwin", 50)),
+                        min_window_msgs=int(st.session_state.get("t_minwin", 6)),
+                        max_tokens=int(st.session_state.get("t_maxtok", 400)),
+                        temperature=max(
+                            0.5, float(st.session_state.get("t_temp", 0.3))
+                        ),
+                        dry_run=False,
+                        redo_fact_key=key,
+                        window_ids=redo_ids or None,
+                        feedback=str(
+                            st.session_state.get(f"topic-fb-{key}-{i}", "") or ""
+                        ),
+                    )
+                st.session_state["t_last_propose"] = {"code": code, "info": info}
+                st.rerun()
+            if cols[2].button("Reject", key=f"topic-rej-{key}-{i}"):
+                out = dict(c)
                 out["status"] = "rejected"
-                _save_candidate(out)
-                add_topic_block(conn, actor_key, "fact_key", out["fact_key"])
-                ph = normalize_phrase(str(out.get("phrase") or ""))
-                if ph:
-                    add_topic_block(conn, actor_key, "phrase", ph)
+                upsert_topic_candidate(conn, actor_key, out)
                 conn.commit()
                 st.rerun()
-            if cols[4].button("Reset pending", key=f"topic-rst-{key}-{i}"):
-                out = _persist_edits()
-                out["status"] = "pending"
-                _save_candidate(out)
-                remove_topic_block(conn, actor_key, "fact_key", out["fact_key"])
-                ph = normalize_phrase(str(out.get("phrase") or ""))
-                if ph:
-                    remove_topic_block(conn, actor_key, "phrase", ph)
-                conn.commit()
-                st.rerun()
+
+    for i, c in enumerate(pending):
+        _render_one(c, i, expanded=True)
+    if other:
+        with st.expander(f"Resolved candidates ({len(other)})", expanded=False):
+            for j, c in enumerate(other):
+                _render_one(c, 1000 + j, expanded=False)
 
 
 def _render_official_topics(conn, actor_key: str) -> None:
     st.subheader("Official topics (`stg.persona_topic_specs`)")
     topics = list_topic_specs(conn, actor_key, enabled_only=False)
     if not topics:
-        st.info("No official topics yet. Approve + Apply from pending.")
+        st.info("No official topics yet. Propose → Approve.")
         return
     for i, spec in enumerate(topics):
         fk = str(spec.get("fact_key") or f"t-{i}")
         enabled = bool(spec.get("enabled", True))
+        title_bits = ", ".join(str(x) for x in (spec.get("match_any") or [])[:3])
         with st.expander(
-            f"[{'on' if enabled else 'off'}] {fk} · kind={spec.get('kind', '?')} · "
-            f"{', '.join(str(x) for x in (spec.get('match_any') or [])[:3])}",
+            f"[{'on' if enabled else 'off'}] {fk} · kind={spec.get('kind', '?')} · {title_bits}",
             expanded=False,
         ):
             st.json(
@@ -351,123 +355,86 @@ def _render_official_topics(conn, actor_key: str) -> None:
                     )
                 }
             )
+            c1, c2, c3 = st.columns(3)
             if enabled:
-                if st.button("Disable", key=f"toff-{fk}-{i}"):
+                if c1.button("Disable", key=f"toff-{fk}-{i}"):
                     set_topic_spec_enabled(conn, actor_key, fk, False)
                     conn.commit()
                     st.rerun()
             else:
-                if st.button("Enable", key=f"ton-{fk}-{i}"):
+                if c1.button("Enable", key=f"ton-{fk}-{i}"):
                     set_topic_spec_enabled(conn, actor_key, fk, True)
                     conn.commit()
                     st.rerun()
+            if c2.button("Delete", key=f"tdel-{fk}-{i}"):
+                delete_topic_spec(conn, actor_key, fk)
+                conn.commit()
+                st.rerun()
 
 
 def _tab_topics(conn, actor_key: str) -> None:
     st.write(
-        "Mine topic slots from chat into Postgres, approve/reject, then apply into "
-        "`stg.persona_topic_specs`. Habit glue is blocked via max DF + Reject as stop."
+        "LLM proposes one topic slot from a random time-bucketed chat window. "
+        "Human gate: Approve (writes official), Redo, or Reject. "
+        "Official topics: Disable / Delete only. No manual slot editing."
     )
-    limit = st.number_input("Topic extract limit", min_value=1, max_value=50, value=15, key="t_limit")
-    since_days = st.number_input("since_days (0=all)", min_value=0, max_value=3650, value=0, key="t_since")
-    min_hits = st.number_input("min_hits", min_value=1, max_value=50, value=5, key="t_hits")
-    min_score = st.number_input("min_score", min_value=0.0, max_value=100.0, value=0.0, key="t_score")
-    max_df = st.number_input(
-        "max_df_ratio (drop habit glue)",
-        min_value=0.001,
-        max_value=0.2,
-        value=0.004,
-        step=0.001,
-        format="%.3f",
-        key="t_df",
-        help="Phrases appearing in at least this fraction of scanned messages are not topics.",
+    kobold = st.text_input(
+        "Kobold URL",
+        value=os.environ.get("KOBOLD_URL", "http://127.0.0.1:5001/v1"),
+        key="t_kobold",
     )
-    max_hits = st.number_input(
-        "max_hits (drop habit glue)",
-        min_value=10,
-        max_value=500,
-        value=40,
-        key="t_max_hits",
+    model = st.text_input(
+        "Model override (empty = first /models id)",
+        value=os.environ.get("KOBOLD_MODEL", ""),
+        key="t_model",
     )
-    default_kind = st.selectbox(
-        "default kind for new drafts",
-        options=["preference", "profile", "episode"],
-        index=0,
-        key="t_kind",
+    c_a, c_b, c_c, c_d = st.columns(4)
+    gap_sec = c_a.number_input("session gap_sec", min_value=600, max_value=86400, value=10800, key="t_gap")
+    min_win = c_b.number_input("min window msgs", min_value=3, max_value=40, value=6, key="t_minwin")
+    max_win = c_c.number_input("max window msgs", min_value=10, max_value=120, value=50, key="t_maxwin")
+    temperature = c_d.number_input(
+        "temperature", min_value=0.0, max_value=1.5, value=0.3, step=0.05, key="t_temp"
     )
-    include_existing = st.checkbox("Include phrases already in official topics", value=False)
-    include_rejected = st.checkbox("Include previously rejected / stopped phrases", value=False)
+    max_tokens = st.number_input("max_tokens", min_value=64, max_value=1200, value=400, key="t_maxtok")
 
-    c1, c2, c3, c4 = st.columns(4)
-    extract_clicked = c1.button("Extract topics ~N", type="primary", key="t_extract")
-    reload_clicked = c2.button("Reload topic pending", key="t_reload")
-    apply_clicked = c3.button(
-        "Apply all approved",
-        key="t_apply",
-        help="Batch-apply every status=approved candidate. Prefer per-row Apply this for one topic.",
-    )
-    promote_clicked = c4.button(
-        "Pending → stops & clear",
-        key="t_promote",
-        help="Move all pending phrases into stop blocks and empty the queue.",
-    )
+    b1, b2 = st.columns(2)
+    propose_clicked = b1.button("Propose one topic", type="primary", key="t_propose")
+    reload_clicked = b2.button("Reload", key="t_reload")
 
-    if extract_clicked:
-        stopwords = load_stopwords(_REPO, None)
-        with st.spinner("Mining topics..."):
-            code = topics_cmd_extract(
+    if propose_clicked:
+        with st.spinner("Sampling window + calling Kobold..."):
+            code, info = cmd_llm_propose_one(
                 conn,
                 actor_key=actor_key,
-                stopwords=stopwords,
-                limit=int(limit),
-                since_days=int(since_days),
-                min_hits=int(min_hits),
-                min_score=float(min_score),
-                max_df_ratio=float(max_df),
-                max_hits=int(max_hits),
-                include_existing=bool(include_existing),
-                include_rejected=bool(include_rejected),
-                default_kind=str(default_kind),
+                kobold_url=kobold,
+                model=model,
+                gap_sec=int(gap_sec),
+                max_window_msgs=int(max_win),
+                min_window_msgs=int(min_win),
+                max_tokens=int(max_tokens),
+                temperature=float(temperature),
                 dry_run=False,
             )
-        st.success("Topic extract finished.") if code == 0 else st.warning(f"code={code}")
-
-    if promote_clicked:
-        code = cmd_promote_pending_to_stops(conn, actor_key, dry_run=False)
-        st.success("Pending phrases promoted to stops.") if code == 0 else st.warning(f"code={code}")
-
-    if apply_clicked:
-        with st.spinner("Applying approved topics..."):
-            code = topics_cmd_apply(conn, actor_key=actor_key, dry_run=False)
+        st.session_state["t_last_propose"] = {"code": code, "info": info}
         if code == 0:
-            st.success("Topics apply finished.")
+            st.success(f"Pending topic `{info.get('fact_key')}`")
         elif code == 1:
-            st.warning("Nothing to apply (no status=approved).")
+            st.info("LLM found no durable topic in that window. Click again.")
+        elif code == 3:
+            st.warning(f"Duplicate of existing slot: {info.get('detail')}. Click again.")
         else:
-            st.error(f"Topics apply failed: {code}")
+            st.error(f"Propose failed: {info}")
+        st.rerun()
 
-    _keys, phrases = list_topic_blocks(conn, actor_key)
-    with st.expander(f"Active stops (phrases={len(phrases)}, keys={len(_keys)})", expanded=False):
-        st.caption("Stopped phrases are excluded from later topic mines.")
-        if phrases:
-            st.write(", ".join(sorted(phrases)[:80]))
-        else:
-            st.write("(none)")
-        for ph in sorted(phrases)[:40]:
-            if st.button(f"Unblock {ph}", key=f"unbl-{ph}"):
-                remove_topic_block(conn, actor_key, "phrase", ph)
-                conn.commit()
-                st.rerun()
+    last = st.session_state.get("t_last_propose")
+    if last and not propose_clicked:
+        st.caption(f"Last propose code={last.get('code')} info_keys={list((last.get('info') or {}).keys())}")
 
     _render_official_topics(conn, actor_key)
     data = load_topics_pending_view(conn, actor_key)
     st.subheader("Pending topic candidates")
     if reload_clicked:
         st.caption("Reloaded from Postgres.")
-    st.caption(
-        f"skipped_high_df={data.get('skipped_high_df', '?')} · "
-        f"skipped_rejected={data.get('skipped_rejected', '?')}"
-    )
     _render_topic_candidates(data, conn, actor_key)
 
 

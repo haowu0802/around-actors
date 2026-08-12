@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Mine topic-slot candidates from stg.messages; human review; apply to Postgres.
+"""Topic-slot governance: LLM propose-one, review, apply to Postgres.
 
-Workflow:
-  extract -> stg.persona_topic_candidates
-  set-status / list
-  apply   -> stg.persona_topic_specs
+Primary workflow:
+  llm-propose -> stg.persona_topic_candidates (pending)
+  approve/apply -> stg.persona_topic_specs
 
-Stopwords may still live in optional private JSON (config, not governance rows).
+Legacy n-gram --mode extract remains for debugging only.
 """
 
 from __future__ import annotations
@@ -15,10 +14,12 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,18 +30,24 @@ _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
+from chat_persona import (  # noqa: E402
+    chat_completion,
+    normalize_kobold_base_url,
+    resolve_model,
+)
 from persona_store import (  # noqa: E402
-    add_topic_block,
+    delete_topic_candidate,
     ensure_governance_schema,
     list_topic_blocks,
     list_topic_candidates,
     list_topic_specs,
+    load_persona_card_db,
     load_topics_pending_view,
-    remove_topic_block,
     replace_topic_candidates,
     set_topic_blocks,
     topic_candidate_to_dict,
     upsert_topic_candidate,
+    upsert_topic_extract_run,
     upsert_topic_spec,
 )
 
@@ -64,14 +71,14 @@ def load_dotenv(path: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Pending topic-slot mine/extract/apply (Postgres governance)"
+        description="Topic slots: LLM propose-one / legacy extract / apply (Postgres)"
     )
     p.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
     p.add_argument("--actor-key", required=True)
     p.add_argument(
         "--mode",
-        choices=("extract", "apply", "list", "set-status"),
-        default="extract",
+        choices=("llm-propose", "extract", "apply", "list", "set-status"),
+        default="llm-propose",
     )
     p.add_argument("--limit", type=int, default=15)
     p.add_argument("--since-days", type=int, default=0)
@@ -81,13 +88,13 @@ def parse_args() -> argparse.Namespace:
         "--max-df-ratio",
         type=float,
         default=0.004,
-        help="Drop phrases that appear in at least this fraction of scanned messages (habit glue)",
+        help="Legacy extract: drop high-DF habit glue",
     )
     p.add_argument(
         "--max-hits",
         type=int,
         default=40,
-        help="Drop phrases with at least this many distinct message hits (habit glue cap)",
+        help="Legacy extract: drop high hit-count habit glue",
     )
     p.add_argument("--include-existing", action="store_true")
     p.add_argument("--include-rejected", action="store_true")
@@ -110,7 +117,32 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--promote-pending-to-stops",
         action="store_true",
-        help="Move all pending candidate phrases into stop blocks and clear the pending queue",
+        help="Legacy: move pending phrases into stop blocks and clear queue",
+    )
+    p.add_argument(
+        "--kobold-url",
+        default=os.environ.get("KOBOLD_URL", "http://127.0.0.1:5001/v1"),
+    )
+    p.add_argument("--model", default=os.environ.get("KOBOLD_MODEL", ""))
+    p.add_argument("--gap-sec", type=int, default=3 * 3600, help="Session gap for windows")
+    p.add_argument("--max-window-msgs", type=int, default=50)
+    p.add_argument("--min-window-msgs", type=int, default=6)
+    p.add_argument("--max-tokens", type=int, default=400)
+    p.add_argument("--temperature", type=float, default=0.3)
+    p.add_argument(
+        "--redo-fact-key",
+        default="",
+        help="Replace this pending candidate after a redo propose",
+    )
+    p.add_argument(
+        "--window-ids",
+        default="",
+        help="Comma-separated message ids to reuse as the propose window (redo)",
+    )
+    p.add_argument(
+        "--feedback",
+        default="",
+        help="Human feedback for redo (why previous proposal was wrong)",
     )
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
@@ -538,19 +570,450 @@ def cmd_set_status(
         c = topic_candidate_to_dict(row)
         c["status"] = status
         upsert_topic_candidate(conn, actor_key, c)
-        phrase = normalize_phrase(str(c.get("phrase") or ""))
-        if status == "rejected":
-            add_topic_block(conn, actor_key, "fact_key", fk)
-            if phrase:
-                add_topic_block(conn, actor_key, "phrase", phrase)
-        elif status in {"pending", "approved"}:
-            remove_topic_block(conn, actor_key, "fact_key", fk)
-            if phrase:
-                remove_topic_block(conn, actor_key, "phrase", phrase)
         n += 1
     conn.commit()
     print(f"updated={n} status={status}")
     return 0 if n else 1
+
+
+JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}")
+
+LLM_TOPIC_SYSTEM = """You propose at most ONE durable memory topic slot about the actor from a chat window.
+A topic is a reusable schema slot for later fact mining (identity, stable preference, health limit, important relationship role).
+Do NOT propose discourse glue, greetings, one-off plans, temporary moods, or style habits.
+The slot title may be an inferred label even if that exact phrase never appears.
+match_any must be concrete search clues that could appear in chat (synonyms / related words).
+In why/title text, refer to the actor only by the provided display name (or say "the actor").
+Never invent a Chinese name from the actor_key spelling.
+Return ONLY JSON, no markdown:
+{"topic": null}
+or
+{"topic": {"title_zh":"...","kind":"preference|profile|episode","match_any":["..."],"prefer_any":["..."],"why":"...","evidence_ids":[123],"confidence":0.0}}
+Use evidence_ids only from message ids present in the window. Prefer kind=preference or profile; use episode only if clearly recurring.
+If nothing durable is present, return {"topic": null}.
+"""
+
+
+def fetch_dialogue_messages(
+    conn: psycopg.Connection, actor_key: str
+) -> list[dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, speaker_role, text_content, create_time_epoch
+            FROM stg.messages
+            WHERE actor_key = %s
+              AND has_semantic_text = TRUE
+              AND speaker_role IN ('self', 'actor')
+              AND text_content IS NOT NULL
+              AND text_content <> ''
+              AND create_time_epoch IS NOT NULL
+            ORDER BY create_time_epoch ASC, id ASC
+            """,
+            (actor_key,),
+        )
+        return list(cur.fetchall())
+
+
+def fetch_messages_by_ids(
+    conn: psycopg.Connection, actor_key: str, ids: list[int]
+) -> list[dict[str, Any]]:
+    if not ids:
+        return []
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, speaker_role, text_content, create_time_epoch
+            FROM stg.messages
+            WHERE actor_key = %s AND id = ANY(%s)
+            ORDER BY create_time_epoch ASC, id ASC
+            """,
+            (actor_key, ids),
+        )
+        return list(cur.fetchall())
+
+
+def split_sessions(
+    rows: list[dict[str, Any]], *, gap_sec: int
+) -> list[list[dict[str, Any]]]:
+    sessions: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
+    prev_ts: int | None = None
+    for r in rows:
+        ts = int(r["create_time_epoch"] or 0)
+        if cur and prev_ts is not None and ts - prev_ts > gap_sec:
+            sessions.append(cur)
+            cur = []
+        cur.append(r)
+        prev_ts = ts
+    if cur:
+        sessions.append(cur)
+    return sessions
+
+
+def month_bucket(session: list[dict[str, Any]]) -> str:
+    ts = int(session[0]["create_time_epoch"] or 0)
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m")
+
+
+def trim_window(
+    session: list[dict[str, Any]], max_msgs: int
+) -> list[dict[str, Any]]:
+    if len(session) <= max_msgs:
+        return session
+    # Prefer the end of the session (usually denser replies).
+    return session[-max_msgs:]
+
+
+def sample_random_window(
+    sessions: list[list[dict[str, Any]]],
+    *,
+    min_msgs: int,
+    max_msgs: int,
+) -> tuple[list[dict[str, Any]], str] | None:
+    usable = [s for s in sessions if len(s) >= min_msgs]
+    if not usable:
+        return None
+    buckets: dict[str, list[list[dict[str, Any]]]] = defaultdict(list)
+    for s in usable:
+        buckets[month_bucket(s)].append(s)
+    bucket_keys = [k for k, v in buckets.items() if v]
+    if not bucket_keys:
+        return None
+    key = random.choice(bucket_keys)
+    session = random.choice(buckets[key])
+    return trim_window(session, max_msgs), key
+
+
+def format_window_for_prompt(window: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for r in window:
+        mid = int(r["id"])
+        role = str(r.get("speaker_role") or "?")
+        text = (r.get("text_content") or "").strip().replace("\n", " ")
+        if len(text) > 240:
+            text = text[:240] + "…"
+        lines.append(f"[id={mid}][{role}] {text}")
+    return "\n".join(lines)
+
+
+def _token_set(values: list[str] | None) -> set[str]:
+    out: set[str] = set()
+    for v in values or []:
+        p = normalize_phrase(str(v))
+        if p:
+            out.add(p)
+    return out
+
+
+def topic_overlaps_existing(
+    match_any: list[str],
+    title: str,
+    *,
+    official: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    skip_fact_key: str | None = None,
+) -> str | None:
+    proposed = _token_set(match_any)
+    title_n = normalize_phrase(title)
+    if title_n:
+        proposed.add(title_n)
+    for spec in official:
+        existing = _token_set(list(spec.get("match_any") or []))
+        existing |= _token_set(list(spec.get("prefer_any") or []))
+        fk = normalize_phrase(str(spec.get("fact_key") or ""))
+        if fk:
+            existing.add(fk)
+        if proposed & existing:
+            return f"overlaps official {spec.get('fact_key')}"
+    for c in candidates:
+        fk = str(c.get("fact_key") or "")
+        if skip_fact_key and fk == skip_fact_key:
+            continue
+        st = str(c.get("status") or "")
+        if st not in {"pending", "approved", "applied"}:
+            continue
+        existing = _token_set(list(c.get("match_any") or []))
+        existing |= _token_set([str(c.get("phrase") or "")])
+        meta = c.get("meta") or {}
+        if isinstance(meta, dict):
+            existing |= _token_set([str(meta.get("title_zh") or "")])
+        if proposed & existing:
+            return f"overlaps candidate {fk}"
+    return None
+
+
+def reject_memory_lines(candidates: list[dict[str, Any]], limit: int = 20) -> list[str]:
+    lines: list[str] = []
+    for c in candidates:
+        if str(c.get("status") or "") != "rejected":
+            continue
+        meta = c.get("meta") if isinstance(c.get("meta"), dict) else {}
+        title = str((meta or {}).get("title_zh") or c.get("phrase") or c.get("fact_key") or "")
+        match = ", ".join(str(x) for x in (c.get("match_any") or [])[:6])
+        lines.append(f"- {title} (match: {match})")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def official_memory_lines(official: list[dict[str, Any]], limit: int = 30) -> list[str]:
+    lines: list[str] = []
+    for spec in official:
+        match = ", ".join(str(x) for x in (spec.get("match_any") or [])[:6])
+        lines.append(f"- {spec.get('fact_key')} kind={spec.get('kind')} match=[{match}]")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def parse_topic_payload(raw: str) -> dict[str, Any] | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        m = JSON_BLOCK_RE.search(text)
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def normalize_llm_topic(
+    payload: dict[str, Any], window_ids: set[int]
+) -> dict[str, Any] | None:
+    topic = payload.get("topic")
+    if topic is None:
+        return None
+    if not isinstance(topic, dict):
+        return None
+    title = str(topic.get("title_zh") or topic.get("title") or "").strip()
+    match_any = [str(x).strip() for x in (topic.get("match_any") or []) if str(x).strip()]
+    prefer_any = [str(x).strip() for x in (topic.get("prefer_any") or []) if str(x).strip()]
+    if not match_any and title:
+        match_any = [title]
+    if not match_any:
+        return None
+    if not prefer_any:
+        prefer_any = list(match_any)
+    kind = str(topic.get("kind") or "preference").strip()
+    if kind not in {"profile", "preference", "episode"}:
+        kind = "preference"
+    evid_raw = topic.get("evidence_ids") or []
+    evid: list[int] = []
+    for x in evid_raw:
+        try:
+            mid = int(x)
+        except (TypeError, ValueError):
+            continue
+        if mid in window_ids:
+            evid.append(mid)
+    try:
+        conf = float(topic.get("confidence") or 0.5)
+    except (TypeError, ValueError):
+        conf = 0.5
+    conf = max(0.0, min(1.0, conf))
+    why = str(topic.get("why") or "").strip()
+    return {
+        "title_zh": title or match_any[0],
+        "kind": kind,
+        "match_any": match_any,
+        "prefer_any": prefer_any,
+        "evidence_ids": evid,
+        "confidence": conf,
+        "why": why,
+    }
+
+
+def cmd_llm_propose_one(
+    conn: psycopg.Connection,
+    *,
+    actor_key: str,
+    kobold_url: str,
+    model: str,
+    gap_sec: int,
+    max_window_msgs: int,
+    min_window_msgs: int,
+    max_tokens: int,
+    temperature: float,
+    dry_run: bool,
+    redo_fact_key: str = "",
+    window_ids: list[int] | None = None,
+    feedback: str = "",
+) -> tuple[int, dict[str, Any]]:
+    """Propose one topic into pending. Returns (code, info).
+
+    codes: 0 ok, 1 no topic, 2 error, 3 duplicate
+    """
+    base = normalize_kobold_base_url(kobold_url)
+    try:
+        model_id = resolve_model(base, model)
+    except Exception as e:
+        print(f"kobold model resolve failed: {e}", file=sys.stderr)
+        return 2, {"error": str(e)}
+
+    official = list_topic_specs(conn, actor_key, enabled_only=False)
+    candidates = [topic_candidate_to_dict(r) for r in list_topic_candidates(conn, actor_key)]
+    bucket = ""
+
+    if window_ids:
+        window = fetch_messages_by_ids(conn, actor_key, window_ids)
+        if len(window) < 2:
+            print("redo window_ids produced too few messages", file=sys.stderr)
+            return 2, {"error": "empty_window"}
+    else:
+        rows = fetch_dialogue_messages(conn, actor_key)
+        sessions = split_sessions(rows, gap_sec=gap_sec)
+        sampled = sample_random_window(
+            sessions, min_msgs=min_window_msgs, max_msgs=max_window_msgs
+        )
+        if not sampled:
+            print("no eligible dialogue windows", file=sys.stderr)
+            return 2, {"error": "no_windows"}
+        window, bucket = sampled
+
+    window_id_list = [int(r["id"]) for r in window]
+    window_id_set = set(window_id_list)
+    excerpts = [
+        (r.get("text_content") or "").strip().replace("\n", " ")[:80] for r in window[:5]
+    ]
+
+    avoid_official = "\n".join(official_memory_lines(official)) or "(none)"
+    avoid_rejected = "\n".join(reject_memory_lines(candidates)) or "(none)"
+    card = load_persona_card_db(conn, actor_key) or {}
+    display_name = str(card.get("display_name") or "").strip() or actor_key
+    user_parts = [
+        f"Actor key (machine id only, not a personal name): {actor_key}",
+        f"Actor display name (use this if you need a name): {display_name}",
+        "Already official topics (do not duplicate):",
+        avoid_official,
+        "Previously rejected proposals (do not repeat):",
+        avoid_rejected,
+        "Chat window:",
+        format_window_for_prompt(window),
+    ]
+    if feedback.strip():
+        user_parts.append(f"Human feedback for redo: {feedback.strip()}")
+    if redo_fact_key.strip():
+        user_parts.append(
+            "This is a REDO of a previous proposal on the SAME window. "
+            "Do not repeat the same title/match_any. Propose a different durable slot, "
+            "or return {\"topic\": null} if none remains."
+        )
+    user_parts.append("Propose zero or one new topic JSON now.")
+
+    messages = [
+        {"role": "system", "content": LLM_TOPIC_SYSTEM},
+        {"role": "user", "content": "\n\n".join(user_parts)},
+    ]
+
+    try:
+        raw = chat_completion(
+            base,
+            model_id,
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=0.9,
+        )
+    except Exception as e:
+        print(f"kobold propose failed: {e}", file=sys.stderr)
+        return 2, {"error": str(e)}
+
+    payload = parse_topic_payload(raw)
+    if payload is None:
+        print(f"parse_failed raw={raw[:300]!r}", file=sys.stderr)
+        return 2, {"error": "parse_failed", "raw": raw[:500]}
+
+    topic = normalize_llm_topic(payload, window_id_set)
+    run_meta = {
+        "mode": "llm_propose_one",
+        "model": model_id,
+        "bucket": bucket,
+        "window_ids": window_id_list,
+        "window_n": len(window_id_list),
+        "raw_preview": (raw or "")[:400],
+    }
+    if topic is None:
+        print("llm_propose_one topic=null")
+        if not dry_run:
+            upsert_topic_extract_run(conn, actor_key, {**run_meta, "last_result": "null"})
+            conn.commit()
+        return 1, {"result": "null", "window_ids": window_id_list, "bucket": bucket}
+
+    skip_key = redo_fact_key.strip() or None
+    overlap = topic_overlaps_existing(
+        topic["match_any"],
+        topic["title_zh"],
+        official=official,
+        candidates=candidates,
+        skip_fact_key=skip_key,
+    )
+    if overlap:
+        print(f"llm_propose_one duplicate: {overlap}")
+        if not dry_run:
+            upsert_topic_extract_run(
+                conn, actor_key, {**run_meta, "last_result": "duplicate", "detail": overlap}
+            )
+            conn.commit()
+        return 3, {
+            "result": "duplicate",
+            "detail": overlap,
+            "window_ids": window_id_list,
+            "bucket": bucket,
+        }
+
+    fact_key = draft_fact_key(topic["title_zh"] + "|" + "|".join(topic["match_any"]))
+    candidate = {
+        "fact_key": fact_key,
+        "status": "pending",
+        "kind": topic["kind"],
+        "phrase": topic["title_zh"],
+        "match_any": topic["match_any"],
+        "prefer_any": topic["prefer_any"],
+        "min_len": 4,
+        "max_len": 80,
+        "hit_count": len(topic["evidence_ids"]) or len(window_id_list),
+        "score": round(100.0 * float(topic["confidence"]), 2),
+        "latest_epoch": int(window[-1]["create_time_epoch"] or 0),
+        "example_message_ids": topic["evidence_ids"] or window_id_list[:5],
+        "example_excerpts": excerpts,
+        "source": "llm_window_v1",
+        "enabled": True,
+        "meta": {
+            "title_zh": topic["title_zh"],
+            "why": topic["why"],
+            "confidence": topic["confidence"],
+            "window_ids": window_id_list,
+            "bucket": bucket,
+            "model": model_id,
+            "feedback": feedback.strip() or None,
+        },
+    }
+    print(
+        f"PROPOSE {fact_key} kind={topic['kind']} title={topic['title_zh']!r} "
+        f"match={topic['match_any']} bucket={bucket}"
+    )
+    if dry_run:
+        return 0, {"result": "dry_run", "candidate": candidate}
+
+    upsert_topic_candidate(conn, actor_key, candidate)
+    if skip_key and skip_key != fact_key:
+        delete_topic_candidate(conn, actor_key, skip_key)
+    upsert_topic_extract_run(
+        conn,
+        actor_key,
+        {**run_meta, "last_result": "pending", "last_fact_key": fact_key},
+    )
+    conn.commit()
+    return 0, {"result": "pending", "fact_key": fact_key, "candidate": candidate}
 
 
 def cmd_apply(
@@ -649,6 +1112,30 @@ def main() -> int:
                 dry_run=args.dry_run,
                 fact_keys=keys or None,
             )
+        if args.mode == "llm-propose":
+            window_ids = [
+                int(x.strip())
+                for x in str(args.window_ids or "").split(",")
+                if x.strip().isdigit()
+            ]
+            code, info = cmd_llm_propose_one(
+                conn,
+                actor_key=args.actor_key,
+                kobold_url=args.kobold_url,
+                model=args.model,
+                gap_sec=int(args.gap_sec),
+                max_window_msgs=int(args.max_window_msgs),
+                min_window_msgs=int(args.min_window_msgs),
+                max_tokens=int(args.max_tokens),
+                temperature=float(args.temperature),
+                dry_run=args.dry_run,
+                redo_fact_key=str(args.redo_fact_key or ""),
+                window_ids=window_ids or None,
+                feedback=str(args.feedback or ""),
+            )
+            if code == 0:
+                print(f"ok {info.get('fact_key') or info.get('result')}")
+            return code
 
         stopwords = load_stopwords(repo_root, args.stopwords_file)
         return cmd_extract(

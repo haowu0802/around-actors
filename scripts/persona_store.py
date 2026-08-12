@@ -101,6 +101,20 @@ def set_topic_spec_enabled(
         return cur.rowcount > 0
 
 
+def delete_topic_spec(
+    conn: psycopg.Connection, actor_key: str, fact_key: str
+) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM stg.persona_topic_specs
+            WHERE actor_key = %s AND fact_key = %s
+            """,
+            (actor_key, fact_key),
+        )
+        return cur.rowcount > 0
+
+
 def replace_topic_specs(
     conn: psycopg.Connection, actor_key: str, specs: list[dict[str, Any]]
 ) -> None:
@@ -215,6 +229,27 @@ def get_topic_extract_run(conn: psycopg.Connection, actor_key: str) -> dict[str,
     meta = dict(row.get("meta") or {})
     meta["generated_at"] = row.get("generated_at").isoformat() if row.get("generated_at") else None
     return meta
+
+
+def upsert_topic_extract_run(
+    conn: psycopg.Connection, actor_key: str, meta: dict[str, Any]
+) -> None:
+    """Merge meta into persona_topic_extract_runs (does not wipe candidates)."""
+    prev = get_topic_extract_run(conn, actor_key)
+    merged = {k: v for k, v in prev.items() if k != "generated_at"}
+    merged.update(meta)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO stg.persona_topic_extract_runs (actor_key, generated_at, meta, updated_at)
+            VALUES (%s, %s, %s, now())
+            ON CONFLICT (actor_key) DO UPDATE SET
+                generated_at = EXCLUDED.generated_at,
+                meta = EXCLUDED.meta,
+                updated_at = now()
+            """,
+            (actor_key, _now(), Jsonb(merged)),
+        )
 
 
 def replace_topic_candidates(
@@ -357,6 +392,7 @@ def topic_candidate_to_dict(row: dict[str, Any]) -> dict[str, Any]:
         "status": row.get("status"),
         "source": row.get("source"),
         "enabled": row.get("enabled", True),
+        "meta": dict(row.get("meta") or {}) if row.get("meta") is not None else {},
     }
 
 
@@ -368,6 +404,10 @@ def load_topics_pending_view(conn: psycopg.Connection, actor_key: str) -> dict[s
         "version": 1,
         "actor_key": actor_key,
         "generated_at": meta.get("generated_at"),
+        "mode": meta.get("mode"),
+        "last_result": meta.get("last_result"),
+        "model": meta.get("model"),
+        "bucket": meta.get("bucket"),
         "messages_scanned": meta.get("messages_scanned"),
         "skipped_existing": meta.get("skipped_existing"),
         "skipped_rejected": meta.get("skipped_rejected"),

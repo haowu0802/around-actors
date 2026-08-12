@@ -10,6 +10,7 @@ Project review guidance for Cursor Bugbot. Coding-agent process rules (git commi
 ## Architecture / product invariants
 
 - Keep **memory** (topics/facts) separate from **voice/style**. Discourse glue and speech habits must not become `fact_key` / topic slots or `stg.persona_facts` rows.
+- Topics populate is LLM propose-one + human Approve/Redo/Reject; do not reintroduce n-gram stop-mining as the primary topic discovery path.
 - Runtime governance for topics, pending queues, and persona cards belongs in Postgres (`stg.persona_*`). Do not reintroduce JSON as the source of truth for those without an explicit migration plan.
 - Locale templates, LoRA exports, and eval fixtures may stay on disk; do not require them to move into PG in a drive-by change.
 

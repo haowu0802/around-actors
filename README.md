@@ -52,12 +52,12 @@ python scripts/ingest_raw.py --ensure-schema --replace \
 
 python scripts/chat_persona.py --actor-key person_a --show-rag
 
-python scripts/build_persona_topics.py --actor-key person_a --mode extract --limit 15
+python scripts/build_persona_topics.py --actor-key person_a --mode llm-propose
 python scripts/build_persona_facts.py --actor-key person_a --mode extract --limit 10
 streamlit run scripts/fact_review_app.py
 ```
 
-`EXPORT_FILE`, `ACTOR_KEY`, and `DATABASE_URL` also work as env vars. Do not hard-code private paths in the repo.
+`EXPORT_FILE`, `ACTOR_KEY`, `DATABASE_URL`, and `KOBOLD_URL` also work as env vars. Do not hard-code private paths in the repo.
 
 DDL highlights: `sql/001_raw_messages.sql`, voice/staging SQL under `sql/`, facts in `sql/004_stg_persona_facts.sql`.
 
@@ -73,7 +73,7 @@ Details: [docs/privacy.md](docs/privacy.md).
 
 ## Next (priority)
 
-1. **Phase V** — Topic Reject → stop; Voice tab (metrics / samples / voice_notes); tighten topic mine DF  
+1. **Phase V** — Grow official topics via LLM Propose one; Voice notes on cards  
 2. **Phase F** — propositional facts + `kind` chat split + intake Q&A  
 3. Deferred: session memory; living interest sim; hybrid retrieval; optional LoRA train  
 
