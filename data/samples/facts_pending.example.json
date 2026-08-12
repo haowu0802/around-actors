@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "actor_key": "person_a",
+  "generated_at": "2026-01-01T00:00:00+00:00",
+  "topics_file": "data/samples/fact_topics.example.json",
+  "limit": 10,
+  "notes": "Example pending file. Real pending lives under data/private/facts_pending/ (gitignored). Set status to approved then run: python scripts/build_persona_facts.py --actor-key person_a --mode apply",
+  "candidates": [
+    {
+      "id": "person_a-example_habit",
+      "op": "upsert",
+      "fact_key": "example_habit",
+      "statement": "preferred short utterance",
+      "evidence_message_ids": [1, 2],
+      "evidence_count_scanned": 3,
+      "score": 72.5,
+      "status": "pending",
+      "source": "topic_heuristic_v1"
+    }
+  ]
+}
