@@ -372,6 +372,7 @@ def load_topics_pending_view(conn: psycopg.Connection, actor_key: str) -> dict[s
         "skipped_existing": meta.get("skipped_existing"),
         "skipped_rejected": meta.get("skipped_rejected"),
         "skipped_low_score": meta.get("skipped_low_score"),
+        "skipped_high_df": meta.get("skipped_high_df"),
         "official_topic_keys": meta.get("official_topic_keys") or [],
         "blocked_fact_keys": sorted(blocked_keys),
         "blocked_phrases": sorted(blocked_phrases),

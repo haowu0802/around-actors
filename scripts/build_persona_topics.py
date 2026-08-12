@@ -77,10 +77,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--since-days", type=int, default=0)
     p.add_argument("--min-hits", type=int, default=3)
     p.add_argument("--min-score", type=float, default=0.0)
+    p.add_argument(
+        "--max-df-ratio",
+        type=float,
+        default=0.004,
+        help="Drop phrases that appear in at least this fraction of scanned messages (habit glue)",
+    )
+    p.add_argument(
+        "--max-hits",
+        type=int,
+        default=40,
+        help="Drop phrases with at least this many distinct message hits (habit glue cap)",
+    )
     p.add_argument("--include-existing", action="store_true")
     p.add_argument("--include-rejected", action="store_true")
     p.add_argument("--stopwords-file", default=None)
-    p.add_argument("--keys", default="")
+    p.add_argument(
+        "--keys",
+        default="",
+        help="Comma-separated fact_key list for set-status, or optional apply subset",
+    )
     p.add_argument(
         "--status",
         default="",
@@ -90,6 +106,11 @@ def parse_args() -> argparse.Namespace:
         "--default-kind",
         default="preference",
         choices=("profile", "preference", "episode"),
+    )
+    p.add_argument(
+        "--promote-pending-to-stops",
+        action="store_true",
+        help="Move all pending candidate phrases into stop blocks and clear the pending queue",
     )
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
@@ -159,7 +180,12 @@ def iter_phrases(text: str) -> set[str]:
             for i in range(0, n - size + 1):
                 found.add(run[i : i + size])
     for tok in LATIN_TOKEN_RE.findall(text or ""):
-        found.add(tok.lower())
+        low = tok.lower()
+        if low in {"http", "https", "www", "com", "http://", "https://"}:
+            continue
+        if low.startswith("http"):
+            continue
+        found.add(low)
     return found
 
 
@@ -232,7 +258,10 @@ def mine_candidates(
     stopwords: set[str],
     min_hits: int,
     now_epoch: int,
-) -> list[dict[str, Any]]:
+    max_df_ratio: float = 0.004,
+    max_hits: int = 40,
+    min_phrase_len: int = 3,
+) -> tuple[list[dict[str, Any]], int]:
     hits: dict[str, set[int]] = defaultdict(set)
     latest: dict[str, int] = {}
     examples: dict[str, list[tuple[int, str]]] = defaultdict(list)
@@ -244,6 +273,8 @@ def mine_candidates(
             continue
         ts = int(r["create_time_epoch"] or 0)
         for phrase in iter_phrases(text):
+            if len(phrase) < min_phrase_len:
+                continue
             if is_noise_phrase(phrase, stopwords):
                 continue
             hits[phrase].add(mid)
@@ -255,9 +286,14 @@ def mine_candidates(
 
     msg_n = max(1, len(rows))
     scored: list[dict[str, Any]] = []
+    skipped_high_df = 0
     for phrase, id_set in hits.items():
         hit_count = len(id_set)
         if hit_count < min_hits:
+            continue
+        df_ratio = hit_count / msg_n
+        if df_ratio >= max_df_ratio or hit_count >= max_hits:
+            skipped_high_df += 1
             continue
         age_days = 9999.0
         ts = latest.get(phrase)
@@ -272,16 +308,11 @@ def mine_candidates(
             if age_days <= 365
             else 2.0
         )
-        length_bonus = 10.0 if len(phrase) >= 3 else 4.0
+        length_bonus = 12.0 if len(phrase) >= 3 else 4.0
         volume = min(35.0, 9.0 * (hit_count**0.5))
-        df_ratio = hit_count / msg_n
         ubiquity_penalty = 0.0
-        if df_ratio >= 0.12:
-            ubiquity_penalty = -45.0
-        elif df_ratio >= 0.05:
-            ubiquity_penalty = -25.0
-        elif df_ratio >= 0.02:
-            ubiquity_penalty = -10.0
+        if df_ratio >= max_df_ratio * 0.66 or hit_count >= int(max_hits * 0.66):
+            ubiquity_penalty = -12.0
         score = min(
             100.0, max(0.0, 15.0 + volume + recency + length_bonus + ubiquity_penalty)
         )
@@ -298,7 +329,8 @@ def mine_candidates(
         )
 
     scored.sort(key=lambda c: (-float(c["score"]), -int(c["hit_count"]), c["phrase"]))
-    return suppress_substrings(scored)
+    kept = suppress_substrings(scored)
+    return kept, skipped_high_df
 
 
 def cmd_extract(
@@ -310,6 +342,8 @@ def cmd_extract(
     since_days: int,
     min_hits: int,
     min_score: float,
+    max_df_ratio: float,
+    max_hits: int,
     include_existing: bool,
     include_rejected: bool,
     default_kind: str,
@@ -331,6 +365,9 @@ def cmd_extract(
             if ph:
                 blocked_phrases.add(ph)
 
+    # Stops are also mine stopwords.
+    stopwords = set(stopwords) | blocked_phrases
+
     official = list_topic_specs(conn, actor_key, enabled_only=False)
     existing_keys = {str(s.get("fact_key") or "") for s in official if s.get("fact_key")}
     existing_phrases = covered_phrases(official)
@@ -338,8 +375,13 @@ def cmd_extract(
     now_epoch = int(time.time())
     min_epoch = now_epoch - since_days * 86400 if since_days > 0 else None
     rows = fetch_actor_messages(conn, actor_key, min_epoch=min_epoch)
-    mined = mine_candidates(
-        rows, stopwords=stopwords, min_hits=min_hits, now_epoch=now_epoch
+    mined, skipped_high_df = mine_candidates(
+        rows,
+        stopwords=stopwords,
+        min_hits=min_hits,
+        now_epoch=now_epoch,
+        max_df_ratio=max_df_ratio,
+        max_hits=max_hits,
     )
 
     skipped_existing = 0
@@ -386,6 +428,7 @@ def cmd_extract(
                 "status": status if status != "rejected" else "pending",
                 "source": "topic_mine_v1",
                 "enabled": True,
+                "meta": {"df_ratio": m.get("df_ratio")},
             }
         )
 
@@ -403,11 +446,14 @@ def cmd_extract(
         "since_days": since_days,
         "min_hits": min_hits,
         "min_score": min_score,
+        "max_df_ratio": max_df_ratio,
+        "max_hits": max_hits,
         "default_kind": default_kind,
         "messages_scanned": len(rows),
         "skipped_existing": skipped_existing,
         "skipped_rejected": skipped_rejected,
         "skipped_low_score": skipped_low,
+        "skipped_high_df": skipped_high_df,
         "official_topic_keys": sorted(existing_keys),
     }
 
@@ -418,7 +464,8 @@ def cmd_extract(
         print(
             f"extract_done actor_key={actor_key} candidates=0 "
             f"skipped_existing={skipped_existing} skipped_rejected={skipped_rejected} "
-            f"skipped_low={skipped_low} messages_scanned={len(rows)} storage=postgres"
+            f"skipped_low={skipped_low} skipped_high_df={skipped_high_df} "
+            f"messages_scanned={len(rows)} storage=postgres"
         )
         return 0
 
@@ -432,8 +479,35 @@ def cmd_extract(
     print(
         f"extract_done actor_key={actor_key} candidates={len(candidates)} "
         f"skipped_existing={skipped_existing} skipped_rejected={skipped_rejected} "
-        f"skipped_low={skipped_low} messages_scanned={len(rows)}"
+        f"skipped_low={skipped_low} skipped_high_df={skipped_high_df} "
+        f"messages_scanned={len(rows)}"
     )
+    return 0
+
+
+def cmd_promote_pending_to_stops(
+    conn: psycopg.Connection, actor_key: str, *, dry_run: bool
+) -> int:
+    """Treat current pending phrases as habit stops and clear the topic queue."""
+    rows = list_topic_candidates(conn, actor_key)
+    blocked_keys, blocked_phrases = list_topic_blocks(conn, actor_key)
+    n = 0
+    for r in rows:
+        ph = normalize_phrase(str(r.get("phrase") or ""))
+        fk = str(r.get("fact_key") or "")
+        if ph:
+            blocked_phrases.add(ph)
+            n += 1
+        if fk:
+            blocked_keys.add(fk)
+        print(f"STOP phrase={ph!r} key={fk}")
+    if dry_run:
+        print(f"dry_run promote_pending_to_stops n={n}")
+        return 0
+    set_topic_blocks(conn, actor_key, fact_keys=blocked_keys, phrases=blocked_phrases)
+    replace_topic_candidates(conn, actor_key, [], run_meta={"cleared_to_stops": n})
+    conn.commit()
+    print(f"promote_pending_to_stops done n={n} pending_cleared=1")
     return 0
 
 
@@ -479,14 +553,35 @@ def cmd_set_status(
     return 0 if n else 1
 
 
-def cmd_apply(conn: psycopg.Connection, *, actor_key: str, dry_run: bool) -> int:
+def cmd_apply(
+    conn: psycopg.Connection,
+    *,
+    actor_key: str,
+    dry_run: bool,
+    fact_keys: list[str] | None = None,
+) -> int:
+    """Apply approved topic candidates into official specs.
+
+    If fact_keys is set, only those approved keys are applied (single or subset).
+    """
+    key_filter = {k.strip() for k in (fact_keys or []) if str(k).strip()} or None
     approved = [
         topic_candidate_to_dict(r)
         for r in list_topic_candidates(conn, actor_key)
         if r.get("status") == "approved"
     ]
+    if key_filter is not None:
+        approved = [
+            c for c in approved if str(c.get("fact_key") or "").strip() in key_filter
+        ]
     if not approved:
-        print("nothing to apply (no status=approved)")
+        if key_filter is not None:
+            print(
+                "nothing to apply (no status=approved matching --keys)",
+                file=sys.stderr,
+            )
+        else:
+            print("nothing to apply (no status=approved)")
         return 1
 
     applied = 0
@@ -534,6 +629,10 @@ def main() -> int:
 
     with psycopg.connect(args.database_url, row_factory=dict_row) as conn:
         ensure_governance_schema(conn, repo_root)
+        if args.promote_pending_to_stops:
+            return cmd_promote_pending_to_stops(
+                conn, args.actor_key, dry_run=args.dry_run
+            )
         if args.mode == "list":
             return cmd_list(conn, args.actor_key)
         if args.mode == "set-status":
@@ -543,7 +642,13 @@ def main() -> int:
                 return 2
             return cmd_set_status(conn, args.actor_key, keys, args.status)
         if args.mode == "apply":
-            return cmd_apply(conn, actor_key=args.actor_key, dry_run=args.dry_run)
+            keys = [k.strip() for k in args.keys.split(",") if k.strip()]
+            return cmd_apply(
+                conn,
+                actor_key=args.actor_key,
+                dry_run=args.dry_run,
+                fact_keys=keys or None,
+            )
 
         stopwords = load_stopwords(repo_root, args.stopwords_file)
         return cmd_extract(
@@ -554,6 +659,8 @@ def main() -> int:
             since_days=args.since_days,
             min_hits=args.min_hits,
             min_score=args.min_score,
+            max_df_ratio=float(args.max_df_ratio),
+            max_hits=int(args.max_hits),
             include_existing=args.include_existing,
             include_rejected=args.include_rejected,
             default_kind=args.default_kind,

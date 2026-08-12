@@ -33,6 +33,7 @@ from build_persona_facts import (  # noqa: E402
 from build_persona_topics import (  # noqa: E402
     cmd_apply as topics_cmd_apply,
     cmd_extract as topics_cmd_extract,
+    cmd_promote_pending_to_stops,
     load_stopwords,
     normalize_phrase,
 )
@@ -43,13 +44,16 @@ from persona_store import (  # noqa: E402
     ensure_governance_schema,
     fact_candidate_to_dict,
     list_persona_card_actors,
+    list_topic_blocks,
     list_topic_specs,
     load_facts_pending_view,
+    load_persona_card_db,
     load_topics_pending_view,
     remove_fact_block,
     remove_topic_block,
     set_topic_spec_enabled,
     upsert_fact_candidate,
+    upsert_persona_card,
     upsert_topic_candidate,
 )
 
@@ -266,7 +270,7 @@ def _render_topic_candidates(data: dict[str, Any], conn, actor_key: str) -> None
                     # Move block key if the old draft key was blocked.
                     remove_topic_block(conn, actor_key, "fact_key", old_fk)
 
-            cols = st.columns(4)
+            cols = st.columns(5)
             if cols[0].button("Save edits", key=f"topic-save-{key}-{i}"):
                 _save_candidate(_persist_edits())
                 conn.commit()
@@ -278,7 +282,25 @@ def _render_topic_candidates(data: dict[str, Any], conn, actor_key: str) -> None
                 remove_topic_block(conn, actor_key, "fact_key", out["fact_key"])
                 conn.commit()
                 st.rerun()
-            if cols[2].button("Reject", key=f"topic-rej-{key}-{i}"):
+            if cols[2].button(
+                "Apply this",
+                key=f"topic-apply-{key}-{i}",
+                disabled=(status != "approved"),
+                help="Write this approved topic into official specs (single apply).",
+            ):
+                out = _persist_edits()
+                out["status"] = "approved"
+                _save_candidate(out)
+                remove_topic_block(conn, actor_key, "fact_key", out["fact_key"])
+                conn.commit()
+                topics_cmd_apply(
+                    conn,
+                    actor_key=actor_key,
+                    dry_run=False,
+                    fact_keys=[str(out["fact_key"])],
+                )
+                st.rerun()
+            if cols[3].button("Reject as stop", key=f"topic-rej-{key}-{i}"):
                 out = _persist_edits()
                 out["status"] = "rejected"
                 _save_candidate(out)
@@ -288,7 +310,7 @@ def _render_topic_candidates(data: dict[str, Any], conn, actor_key: str) -> None
                     add_topic_block(conn, actor_key, "phrase", ph)
                 conn.commit()
                 st.rerun()
-            if cols[3].button("Reset pending", key=f"topic-rst-{key}-{i}"):
+            if cols[4].button("Reset pending", key=f"topic-rst-{key}-{i}"):
                 out = _persist_edits()
                 out["status"] = "pending"
                 _save_candidate(out)
@@ -344,12 +366,29 @@ def _render_official_topics(conn, actor_key: str) -> None:
 def _tab_topics(conn, actor_key: str) -> None:
     st.write(
         "Mine topic slots from chat into Postgres, approve/reject, then apply into "
-        "`stg.persona_topic_specs`."
+        "`stg.persona_topic_specs`. Habit glue is blocked via max DF + Reject as stop."
     )
     limit = st.number_input("Topic extract limit", min_value=1, max_value=50, value=15, key="t_limit")
     since_days = st.number_input("since_days (0=all)", min_value=0, max_value=3650, value=0, key="t_since")
-    min_hits = st.number_input("min_hits", min_value=1, max_value=50, value=3, key="t_hits")
+    min_hits = st.number_input("min_hits", min_value=1, max_value=50, value=5, key="t_hits")
     min_score = st.number_input("min_score", min_value=0.0, max_value=100.0, value=0.0, key="t_score")
+    max_df = st.number_input(
+        "max_df_ratio (drop habit glue)",
+        min_value=0.001,
+        max_value=0.2,
+        value=0.004,
+        step=0.001,
+        format="%.3f",
+        key="t_df",
+        help="Phrases appearing in at least this fraction of scanned messages are not topics.",
+    )
+    max_hits = st.number_input(
+        "max_hits (drop habit glue)",
+        min_value=10,
+        max_value=500,
+        value=40,
+        key="t_max_hits",
+    )
     default_kind = st.selectbox(
         "default kind for new drafts",
         options=["preference", "profile", "episode"],
@@ -357,12 +396,21 @@ def _tab_topics(conn, actor_key: str) -> None:
         key="t_kind",
     )
     include_existing = st.checkbox("Include phrases already in official topics", value=False)
-    include_rejected = st.checkbox("Include previously rejected phrases", value=False)
+    include_rejected = st.checkbox("Include previously rejected / stopped phrases", value=False)
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     extract_clicked = c1.button("Extract topics ~N", type="primary", key="t_extract")
     reload_clicked = c2.button("Reload topic pending", key="t_reload")
-    apply_clicked = c3.button("Apply approved topics", key="t_apply")
+    apply_clicked = c3.button(
+        "Apply all approved",
+        key="t_apply",
+        help="Batch-apply every status=approved candidate. Prefer per-row Apply this for one topic.",
+    )
+    promote_clicked = c4.button(
+        "Pending → stops & clear",
+        key="t_promote",
+        help="Move all pending phrases into stop blocks and empty the queue.",
+    )
 
     if extract_clicked:
         stopwords = load_stopwords(_REPO, None)
@@ -375,12 +423,18 @@ def _tab_topics(conn, actor_key: str) -> None:
                 since_days=int(since_days),
                 min_hits=int(min_hits),
                 min_score=float(min_score),
+                max_df_ratio=float(max_df),
+                max_hits=int(max_hits),
                 include_existing=bool(include_existing),
                 include_rejected=bool(include_rejected),
                 default_kind=str(default_kind),
                 dry_run=False,
             )
         st.success("Topic extract finished.") if code == 0 else st.warning(f"code={code}")
+
+    if promote_clicked:
+        code = cmd_promote_pending_to_stops(conn, actor_key, dry_run=False)
+        st.success("Pending phrases promoted to stops.") if code == 0 else st.warning(f"code={code}")
 
     if apply_clicked:
         with st.spinner("Applying approved topics..."):
@@ -392,12 +446,128 @@ def _tab_topics(conn, actor_key: str) -> None:
         else:
             st.error(f"Topics apply failed: {code}")
 
+    _keys, phrases = list_topic_blocks(conn, actor_key)
+    with st.expander(f"Active stops (phrases={len(phrases)}, keys={len(_keys)})", expanded=False):
+        st.caption("Stopped phrases are excluded from later topic mines.")
+        if phrases:
+            st.write(", ".join(sorted(phrases)[:80]))
+        else:
+            st.write("(none)")
+        for ph in sorted(phrases)[:40]:
+            if st.button(f"Unblock {ph}", key=f"unbl-{ph}"):
+                remove_topic_block(conn, actor_key, "phrase", ph)
+                conn.commit()
+                st.rerun()
+
     _render_official_topics(conn, actor_key)
     data = load_topics_pending_view(conn, actor_key)
     st.subheader("Pending topic candidates")
     if reload_clicked:
         st.caption("Reloaded from Postgres.")
+    st.caption(
+        f"skipped_high_df={data.get('skipped_high_df', '?')} · "
+        f"skipped_rejected={data.get('skipped_rejected', '?')}"
+    )
     _render_topic_candidates(data, conn, actor_key)
+
+
+def _compute_voice_metrics(conn, actor_key: str, limit: int = 12000) -> dict[str, Any]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT text_content
+            FROM stg.messages
+            WHERE actor_key = %s
+              AND speaker_role = 'actor'
+              AND has_semantic_text = TRUE
+              AND char_length(text_content) BETWEEN 1 AND 120
+            ORDER BY create_time_epoch DESC NULLS LAST
+            LIMIT %s
+            """,
+            (actor_key, limit),
+        )
+        texts = [(r["text_content"] or "").strip() for r in cur.fetchall()]
+    n = max(1, len(texts))
+    lens = [len(t) for t in texts]
+    sticker_n = sum(1 for t in texts if "[" in t and "]" in t)
+    laugh_n = sum(1 for t in texts if "哈" in t)
+    return {
+        "messages_scanned": len(texts),
+        "avg_len": round(sum(lens) / n, 2),
+        "short_le_8_ratio": round(sum(1 for L in lens if L <= 8) / n, 4),
+        "long_ge_40_ratio": round(sum(1 for L in lens if L >= 40) / n, 4),
+        "sticker_msg_ratio": round(sticker_n / n, 4),
+        "laugh_msg_ratio": round(laugh_n / n, 4),
+    }
+
+
+def _draft_voice_notes(metrics: dict[str, Any]) -> list[str]:
+    notes: list[str] = []
+    avg = float(metrics.get("avg_len") or 0)
+    short = float(metrics.get("short_le_8_ratio") or 0)
+    sticker = float(metrics.get("sticker_msg_ratio") or 0)
+    laugh = float(metrics.get("laugh_msg_ratio") or 0)
+    if short >= 0.6:
+        notes.append("Prefers very short chat bubbles")
+    elif avg <= 12:
+        notes.append("Keeps messages short; not essay-like")
+    else:
+        notes.append("Comfortable with mid-length chat lines")
+    if sticker >= 0.05:
+        notes.append("Often uses WeChat stickers/emoji brackets in text")
+    else:
+        notes.append("Rarely uses sticker/emoji bracket tokens")
+    if laugh >= 0.04:
+        notes.append("Laugh particles appear often in casual turns")
+    notes.append("Tone from style samples only; do not invent biography")
+    return notes
+
+
+def _tab_voice(conn, actor_key: str) -> None:
+    st.write(
+        "Voice/style channel (not topics/facts). Metrics are automatic; voice_notes "
+        "persist on `stg.persona_cards` and feed chat tone."
+    )
+    metrics = _compute_voice_metrics(conn, actor_key)
+    st.subheader("Metrics")
+    st.json(metrics)
+
+    card = load_persona_card_db(conn, actor_key) or {
+        "display_name": actor_key,
+        "voice_notes": [],
+        "boundaries": [],
+        "extra_rules": [],
+        "known_facts": [],
+    }
+    draft = _draft_voice_notes(metrics)
+    st.subheader("Voice notes")
+    st.caption("Edit and save. Draft from metrics is a starting point only.")
+    if st.button("Fill from metrics draft", key="v_fill"):
+        st.session_state["voice_notes_text"] = "\n".join(draft)
+    existing = card.get("voice_notes") or []
+    default_text = st.session_state.get(
+        "voice_notes_text",
+        "\n".join(str(x) for x in existing) if existing else "\n".join(draft),
+    )
+    notes_text = st.text_area("One note per line", value=default_text, height=180, key="v_notes")
+    if st.button("Save voice notes to persona card", type="primary", key="v_save"):
+        notes = [ln.strip() for ln in notes_text.splitlines() if ln.strip()]
+        card = dict(card)
+        card["voice_notes"] = notes
+        if not card.get("display_name"):
+            card["display_name"] = actor_key
+        upsert_persona_card(conn, actor_key, card)
+        conn.commit()
+        st.session_state["voice_notes_text"] = "\n".join(notes)
+        st.success("Saved to stg.persona_cards")
+
+    st.subheader("Style sample peek")
+    st.caption("Random actor lines used by chat (tone only). Approve flow can deepen later.")
+    from chat_persona import fetch_style_lines
+
+    samples = fetch_style_lines(conn, actor_key, 8, 4, 40)
+    for s in samples:
+        st.write(f"- {s}")
 
 
 def _tab_facts(conn, actor_key: str) -> None:
@@ -500,11 +670,13 @@ def main() -> None:
             actor_key = st.selectbox("actor_key", options=actors, index=default_ix)
             st.session_state["actor_key"] = actor_key
 
-        tab_topics, tab_facts = st.tabs(["Topics", "Facts"])
+        tab_topics, tab_facts, tab_voice = st.tabs(["Topics", "Facts", "Voice"])
         with tab_topics:
             _tab_topics(conn, actor_key)
         with tab_facts:
             _tab_facts(conn, actor_key)
+        with tab_voice:
+            _tab_voice(conn, actor_key)
     finally:
         conn.close()
 

@@ -130,11 +130,12 @@ evidence → draft_statement (LLM or template) → human approve → DB statemen
 - Governance DDL + JSON→PG import: `sql/005_persona_governance.sql`, `migrate_private_json_to_pg.py`
 - Rejected-key blocking; optional diversify; LoRA pair export (train optional)
 
-### Phase V — Voice & stops (next product focus)
+### Phase V — Voice & stops (in progress)
 
-- Stop/block MVP from Topic Reject; consume in mine
-- Voice tab (metrics, samples, voice_notes on `persona_cards`)
-- Tighten topic mine (max DF, prefer contentful phrases)
+- Stop/block MVP: Reject as stop + promote-pending-to-stops; mine consumes blocks as stopwords
+- Topic mine hardened: `max_df_ratio` + `max_hits` drop habit glue; min phrase length 3
+- Voice tab: metrics + voice_notes on `stg.persona_cards` (+ style sample peek)
+- Optional later: dedicated Stop mine queue with `stop|voice_marker|discard` labels
 
 ### Phase F — Facts maturation
 
